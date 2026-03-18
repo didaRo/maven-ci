@@ -1,0 +1,88 @@
+image: maven:3.9.6-eclipse-temurin-21
+
+variables:
+  PROJECT_DIR: "examples/spring-boot-actuator"
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  MAVEN_CLI_OPTS: "-B -ntp"
+  GIT_DEPTH: "0"
+  MAVEN_DEPLOY_SERVER_ID: "gitlab-maven"
+  SNAPSHOT_BRANCH_REGEX: "^US[0-9][A-Za-z0-9._/-]*$"
+  ENABLE_SONAR: "false"
+  SONAR_ALLOW_FAILURE: "true"
+  ENABLE_OWASP: "true"
+  OWASP_ALLOW_FAILURE: "false"
+  OWASP_ALLOW_WITHOUT_NVD_API_KEY: "false"
+  OWASP_FAIL_CVSS: "9.0"
+  OWASP_NVD_VALID_HOURS: "24"
+  RELEASE_ARGS: "-DskipTests -Dquality.owasp.skip=true -Dsonar.skip=true"
+
+cache:
+  key: "$CI_PROJECT_NAME-m2"
+  paths:
+    - .m2/repository
+    - .m2/dependency-check-data
+
+stages:
+  - verify
+  - quality
+  - snapshot
+  - release
+
+default:
+  before_script:
+    - chmod +x .gitlab/scripts/*.sh
+    - . ./.gitlab/scripts/bootstrap.sh
+
+build_test:
+  stage: verify
+  script:
+    - ./.gitlab/scripts/build-test.sh
+  artifacts:
+    when: always
+    paths:
+      - ${PROJECT_DIR}/target
+    reports:
+      junit:
+        - ${PROJECT_DIR}/target/surefire-reports/*.xml
+        - ${PROJECT_DIR}/target/failsafe-reports/*.xml
+
+sonar_quality:
+  stage: quality
+  script:
+    - ./.gitlab/scripts/sonar-quality.sh
+
+owasp_security:
+  stage: quality
+  script:
+    - ./.gitlab/scripts/owasp-security.sh
+
+snapshot_publish_auto:
+  stage: snapshot
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^US[0-9][A-Za-z0-9._\/-]*$/'
+      when: on_success
+    - when: never
+  script:
+    - ./.gitlab/scripts/publish-snapshot.sh auto
+
+snapshot_publish_manual:
+  stage: snapshot
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH =~ /^US[0-9][A-Za-z0-9._\/-]*$/'
+      when: manual
+    - when: never
+  allow_failure: false
+  script:
+    - ./.gitlab/scripts/publish-snapshot.sh manual
+
+release:
+  stage: release
+  resource_group: release
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+    - when: never
+  script:
+    - ./.gitlab/scripts/run-release.sh

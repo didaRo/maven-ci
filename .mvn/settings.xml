@@ -1,0 +1,31 @@
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+	<servers>
+		<server>
+			<id>github</id>
+			<username>${env.GITHUB_ACTOR}</username>
+			<password>${env.GITHUB_TOKEN}</password>
+		</server>
+		<!-- Optional credentials for enterprise hardened OWASP internal mirrors -->
+		<server>
+			<id>owasp-nvd</id>
+			<username>${env.OWASP_NVD_USERNAME}</username>
+			<password>${env.OWASP_NVD_PASSWORD}</password>
+		</server>
+		<server>
+			<id>owasp-suppressions</id>
+			<username>${env.OWASP_HOSTED_SUPPRESSIONS_USERNAME}</username>
+			<password>${env.OWASP_HOSTED_SUPPRESSIONS_PASSWORD}</password>
+		</server>
+		<server>
+			<id>owasp-retirejs</id>
+			<username>${env.OWASP_RETIREJS_USERNAME}</username>
+			<password>${env.OWASP_RETIREJS_PASSWORD}</password>
+		</server>
+		<server>
+			<id>owasp-known-exploited</id>
+			<username>${env.OWASP_KNOWN_EXPLOITED_USERNAME}</username>
+			<password>${env.OWASP_KNOWN_EXPLOITED_PASSWORD}</password>
+		</server>
+	</servers>
+</settings>

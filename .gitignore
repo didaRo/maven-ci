@@ -1,0 +1,24 @@
+# IDE/editor caches
+.vscode/
+.vs/
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# Maven build output
+target/
+.m2/
+release.properties
+pom.xml.releaseBackup
+pom.xml.tag
+pom.xml.next
+pom.xml.backup
+pom.xml.versionsBackup
+
+# OS files
+.DS_Store
+Thumbs.db

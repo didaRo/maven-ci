@@ -1,0 +1,226 @@
+name: Maven Snapshot Publish
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Maven Build, Test and Quality
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+concurrency:
+  group: maven-snapshot-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_DIR: ${{ vars.CI_PROJECT_DIR || 'examples/spring-boot-actuator' }}
+  BUILD_JAVA_VERSION: ${{ vars.CI_BUILD_JAVA_VERSION || '25' }}
+  SNAPSHOT_BRANCH_REGEX: ${{ vars.CI_SNAPSHOT_BRANCH_REGEX || '^US[0-9][A-Za-z0-9._/-]*$' }}
+
+jobs:
+  snapshot_policy:
+    name: Snapshot policy
+    runs-on: ubuntu-latest
+    outputs:
+      target_branch: ${{ steps.resolve.outputs.target_branch }}
+      target_sha: ${{ steps.resolve.outputs.target_sha }}
+      trigger_mode: ${{ steps.resolve.outputs.trigger_mode }}
+      source_event: ${{ steps.resolve.outputs.source_event }}
+      should_publish: ${{ steps.policy.outputs.should_publish }}
+    steps:
+      - name: Resolve snapshot target
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "trigger_mode=automatic" >> "$GITHUB_OUTPUT"
+            echo "target_branch=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+            echo "target_sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+            echo "source_event=${{ github.event.workflow_run.event }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "trigger_mode=manual" >> "$GITHUB_OUTPUT"
+            echo "target_branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "target_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "source_event=workflow_dispatch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate snapshot trigger policy
+        id: policy
+        shell: bash
+        env:
+          SOURCE_EVENT: ${{ steps.resolve.outputs.source_event }}
+          TARGET_BRANCH: ${{ steps.resolve.outputs.target_branch }}
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+          TRIGGER_MODE: ${{ steps.resolve.outputs.trigger_mode }}
+        run: |
+          should_publish=false
+          reason=""
+
+          if [ "$TRIGGER_MODE" = "automatic" ]; then
+            if [ "$SOURCE_EVENT" != "push" ]; then
+              reason="Automatic snapshot publish only runs after CI triggered by push events. Source event: $SOURCE_EVENT."
+            elif [[ "$TARGET_BRANCH" =~ $SNAPSHOT_BRANCH_REGEX ]]; then
+              should_publish=true
+              reason="Automatic snapshot publish is enabled for user story branch $TARGET_BRANCH after a fully green Maven Build, Test and Quality run."
+            else
+              reason="Branch $TARGET_BRANCH does not match CI_SNAPSHOT_BRANCH_REGEX=$SNAPSHOT_BRANCH_REGEX."
+            fi
+          else
+            should_publish=true
+            reason="Manual snapshot publish is allowed on any branch, but it still requires a fully green Maven Build, Test and Quality run for the selected commit."
+          fi
+
+          echo "should_publish=$should_publish" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Snapshot policy"
+            echo
+            echo "- Trigger mode: \`$TRIGGER_MODE\`"
+            echo "- Branch: \`$TARGET_BRANCH\`"
+            echo "- Commit: \`$TARGET_SHA\`"
+            echo "- Branch regex: \`$SNAPSHOT_BRANCH_REGEX\`"
+            echo "- Decision: \`$should_publish\`"
+            echo "- Reason: $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip automatic snapshot publish
+        if: ${{ steps.resolve.outputs.trigger_mode == 'automatic' && steps.policy.outputs.should_publish != 'true' }}
+        shell: bash
+        run: |
+          echo "Automatic snapshot publish skipped by policy."
+
+  snapshot_guard:
+    name: Snapshot guard
+    runs-on: ubuntu-latest
+    needs: snapshot_policy
+    if: ${{ needs.snapshot_policy.outputs.should_publish == 'true' }}
+    steps:
+      - name: Ensure Maven Build, Test and Quality is green on this commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const workflowName = 'Maven Build, Test and Quality';
+            const { owner, repo } = context.repo;
+            const triggerMode = '${{ needs.snapshot_policy.outputs.trigger_mode }}';
+            const branch = '${{ needs.snapshot_policy.outputs.target_branch }}';
+            const sha = '${{ needs.snapshot_policy.outputs.target_sha }}';
+            let matchedRun;
+
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner,
+              repo,
+              per_page: 100
+            });
+
+            const workflow = workflows.data.workflows.find((candidate) => candidate.name === workflowName);
+            if (!workflow) {
+              core.setFailed(`Workflow "${workflowName}" not found in ${owner}/${repo}.`);
+              return;
+            }
+
+            if (triggerMode === 'automatic') {
+              matchedRun = context.payload.workflow_run;
+            } else {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: workflow.id,
+                branch,
+                event: 'push',
+                per_page: 100
+              });
+
+              matchedRun = runs.data.workflow_runs.find((candidate) => candidate.head_sha === sha);
+              if (!matchedRun) {
+                core.setFailed(`No "${workflowName}" push run was found for commit ${sha} on branch ${branch}. Push the commit and wait for CI before launching the snapshot workflow.`);
+                return;
+              }
+            }
+
+            core.info(`Matched CI run #${matchedRun.run_number} with status=${matchedRun.status} conclusion=${matchedRun.conclusion}`);
+
+            if (matchedRun.status !== 'completed' || matchedRun.conclusion !== 'success') {
+              core.setFailed(`"${workflowName}" must be fully green before publishing a snapshot. Current status=${matchedRun.status}, conclusion=${matchedRun.conclusion}.`);
+            }
+
+  snapshot:
+    name: Deploy SNAPSHOT to GitHub Packages
+    runs-on: ubuntu-latest
+    needs:
+      - snapshot_policy
+      - snapshot_guard
+    if: ${{ needs.snapshot_policy.outputs.should_publish == 'true' }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+      MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.snapshot_policy.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Resolve Maven credentials
+        shell: bash
+        run: |
+          if [ -z "$MAVEN_USERNAME" ]; then
+            echo "MAVEN_USERNAME=$GITHUB_ACTOR" >> "$GITHUB_ENV"
+          fi
+          if [ -z "$MAVEN_PASSWORD" ]; then
+            echo "MAVEN_PASSWORD=$GITHUB_TOKEN" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.BUILD_JAVA_VERSION }}
+          cache: maven
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      - name: Detect project version
+        id: version
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          VERSION=$("$MVN" -q -DforceStdout -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [[ "$VERSION" == *-SNAPSHOT ]]; then
+            echo "is_snapshot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_snapshot=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy snapshot
+        if: ${{ steps.version.outputs.is_snapshot == 'true' }}
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          "$MVN" -B -ntp -f "$PROJECT_DIR/pom.xml" -Djava.version="$BUILD_JAVA_VERSION" -DskipTests deploy
+
+      - name: Skip non-SNAPSHOT
+        if: ${{ steps.version.outputs.is_snapshot != 'true' }}
+        shell: bash
+        run: |
+          echo "Version ${{ steps.version.outputs.version }} is not a SNAPSHOT. Snapshot publish skipped."

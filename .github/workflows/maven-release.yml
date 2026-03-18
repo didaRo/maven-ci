@@ -1,0 +1,436 @@
+name: Maven Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_kind:
+        description: "How to compute the release version"
+        required: true
+        default: current
+        type: choice
+        options:
+          - current
+          - patch
+          - minor
+          - major
+          - custom
+      release_version:
+        description: "Required when release_kind=custom (example: 1.4.0)"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+env:
+  PROJECT_DIR: ${{ vars.CI_PROJECT_DIR || 'examples/spring-boot-actuator' }}
+  BUILD_JAVA_VERSION: ${{ vars.CI_BUILD_JAVA_VERSION || '25' }}
+  RELEASE_JAVA_VERSION: ${{ vars.CI_RELEASE_JAVA_VERSION || vars.CI_BUILD_JAVA_VERSION || '25' }}
+  RELEASE_SIGNING_ENABLED: ${{ vars.CI_ENABLE_GPG_SIGNING || 'false' }}
+
+jobs:
+  release_guard:
+    name: Release guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release inputs
+        shell: bash
+        env:
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          TRIMMED_RELEASE_VERSION="$(printf '%s' "$RELEASE_VERSION" | xargs)"
+
+          if [ "$RELEASE_KIND" = "custom" ] && [ -z "$TRIMMED_RELEASE_VERSION" ]; then
+            {
+              echo "## Release input error"
+              echo
+              echo "- release_kind: \`$RELEASE_KIND\`"
+              echo "- release_version: empty"
+              echo
+              echo "When \`release_kind=custom\`, you must provide an explicit semantic version such as \`1.2.0\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::release_version is mandatory when release_kind=custom."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Ensure workflow runs on the default branch
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${{ github.event.repository.default_branch }}" ]; then
+            echo "Release workflow must run on the default branch: ${{ github.event.repository.default_branch }}"
+            exit 1
+          fi
+
+      - name: Ensure the default branch is protected
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const branch = context.payload.repository.default_branch;
+            const { data } = await github.rest.repos.getBranch({
+              owner,
+              repo,
+              branch
+            });
+
+            core.info(`Default branch ${branch} protected=${data.protected}`);
+
+            if (!data.protected) {
+              core.setFailed(`Release workflow requires the default branch ${branch} to be protected.`);
+            }
+
+      - name: Ensure Maven Build, Test and Quality is green on this commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const workflowName = 'Maven Build, Test and Quality';
+            const { owner, repo } = context.repo;
+            const branch = context.ref.replace('refs/heads/', '');
+            const sha = context.sha;
+
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner,
+              repo,
+              per_page: 100
+            });
+
+            const workflow = workflows.data.workflows.find((candidate) => candidate.name === workflowName);
+            if (!workflow) {
+              core.setFailed(`Workflow "${workflowName}" not found in ${owner}/${repo}.`);
+              return;
+            }
+
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: workflow.id,
+              branch,
+              per_page: 100
+            });
+
+            const matchedRun = runs.data.workflow_runs.find((candidate) => candidate.head_sha === sha);
+            if (!matchedRun) {
+              core.setFailed(`No "${workflowName}" run was found for commit ${sha} on branch ${branch}. Push the commit and wait for CI before launching the release workflow.`);
+              return;
+            }
+
+            core.info(`Matched CI run #${matchedRun.run_number} with status=${matchedRun.status} conclusion=${matchedRun.conclusion}`);
+
+            if (matchedRun.status !== 'completed' || matchedRun.conclusion !== 'success') {
+              core.setFailed(`"${workflowName}" must be fully green before starting a release. Current status=${matchedRun.status}, conclusion=${matchedRun.conclusion}.`);
+            }
+
+  release:
+    name: Perform release
+    runs-on: ubuntu-latest
+    needs: release_guard
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+      MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+      RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+          persist-credentials: false
+
+      - name: Ensure workflow runs on the default branch
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "${{ github.event.repository.default_branch }}" ]; then
+            echo "Release workflow must run on the default branch: ${{ github.event.repository.default_branch }}"
+            exit 1
+          fi
+
+      - name: Configure git identity for release commits
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Use release PAT when provided
+        if: ${{ env.RELEASE_PAT != '' }}
+        shell: bash
+        run: |
+          git remote set-url origin "https://x-access-token:${RELEASE_PAT}@github.com/${{ github.repository }}.git"
+
+      - name: Ensure local branch checkout for maven-release-plugin
+        shell: bash
+        run: |
+          git fetch origin "${GITHUB_REF_NAME}" --depth=1
+          git checkout -B "${GITHUB_REF_NAME}" "origin/${GITHUB_REF_NAME}"
+          git status --short --branch
+
+      - name: Resolve Maven credentials
+        shell: bash
+        run: |
+          if [ -z "$MAVEN_USERNAME" ]; then
+            echo "MAVEN_USERNAME=$GITHUB_ACTOR" >> "$GITHUB_ENV"
+          fi
+          if [ -z "$MAVEN_PASSWORD" ]; then
+            echo "MAVEN_PASSWORD=$GITHUB_TOKEN" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$RELEASE_PAT" ]; then
+            echo "SCM_USERNAME=x-access-token" >> "$GITHUB_ENV"
+            echo "SCM_PASSWORD=$RELEASE_PAT" >> "$GITHUB_ENV"
+          else
+            echo "SCM_USERNAME=$GITHUB_ACTOR" >> "$GITHUB_ENV"
+            echo "SCM_PASSWORD=$GITHUB_TOKEN" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.RELEASE_JAVA_VERSION }}
+          cache: maven
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      - name: Validate signing configuration
+        if: ${{ env.RELEASE_SIGNING_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::CI_ENABLE_GPG_SIGNING=true but GPG_PRIVATE_KEY is not configured."
+            exit 1
+          fi
+
+          if [ -z "$GPG_PASSPHRASE" ]; then
+            echo "::error::CI_ENABLE_GPG_SIGNING=true but GPG_PASSPHRASE is not configured."
+            exit 1
+          fi
+
+      - name: Import GPG key (optional)
+        if: ${{ env.RELEASE_SIGNING_ENABLED == 'true' && env.GPG_PRIVATE_KEY != '' }}
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ env.GPG_PRIVATE_KEY }}
+          passphrase: ${{ env.GPG_PASSPHRASE }}
+
+      - name: Resolve release plan
+        id: plan
+        shell: bash
+        run: |
+          validate_semver() {
+            local version="$1"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?$ ]]; then
+              echo "Invalid semantic version: $version"
+              exit 1
+            fi
+          }
+
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          CURRENT_VERSION=$("$MVN" -q -DforceStdout -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+          CURRENT_BASE_VERSION="${CURRENT_VERSION%-SNAPSHOT}"
+          validate_semver "$CURRENT_BASE_VERSION"
+
+          evaluate_version_property() {
+            local expression="$1"
+            "$MVN" -q -DforceStdout -f "$PROJECT_DIR/pom.xml" build-helper:parse-version help:evaluate "-Dexpression=$expression" | tail -n 1
+          }
+
+          evaluate_release_version_property() {
+            local version_string="$1"
+            local expression="$2"
+            "$MVN" -q -DforceStdout -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$version_string" help:evaluate "-Dexpression=$expression" | tail -n 1
+          }
+
+          CURRENT_MAJOR=$(evaluate_version_property "parsedVersion.majorVersion")
+          CURRENT_MINOR=$(evaluate_version_property "parsedVersion.minorVersion")
+          NEXT_MAJOR=$(evaluate_version_property "parsedVersion.nextMajorVersion")
+          NEXT_MINOR=$(evaluate_version_property "parsedVersion.nextMinorVersion")
+          NEXT_INCREMENTAL=$(evaluate_version_property "parsedVersion.nextIncrementalVersion")
+
+          RELEASE_KIND="${{ inputs.release_kind }}"
+          REQUESTED_RELEASE_VERSION="${{ inputs.release_version }}"
+          case "$RELEASE_KIND" in
+            current)
+              RELEASE_VERSION="$CURRENT_BASE_VERSION"
+              ;;
+            patch)
+              RELEASE_VERSION="${CURRENT_MAJOR}.${CURRENT_MINOR}.${NEXT_INCREMENTAL}"
+              ;;
+            minor)
+              RELEASE_VERSION="${CURRENT_MAJOR}.${NEXT_MINOR}.0"
+              ;;
+            major)
+              RELEASE_VERSION="${NEXT_MAJOR}.0.0"
+              ;;
+            custom)
+              if [ -z "$REQUESTED_RELEASE_VERSION" ]; then
+                echo "release_version is mandatory when release_kind=custom"
+                exit 1
+              fi
+              RELEASE_VERSION="$REQUESTED_RELEASE_VERSION"
+              ;;
+          esac
+
+          if [ -n "$REQUESTED_RELEASE_VERSION" ]; then
+            RELEASE_VERSION="$REQUESTED_RELEASE_VERSION"
+          fi
+
+          RELEASE_VERSION="${RELEASE_VERSION%-SNAPSHOT}"
+          validate_semver "$RELEASE_VERSION"
+          RELEASE_MAJOR=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.majorVersion")
+          RELEASE_MINOR=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.minorVersion")
+          RELEASE_NEXT_INCREMENTAL=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.nextIncrementalVersion")
+
+          DEFAULT_NEXT_SNAPSHOT_VERSION="${RELEASE_MAJOR}.${RELEASE_MINOR}.${RELEASE_NEXT_INCREMENTAL}-SNAPSHOT"
+          NEXT_SNAPSHOT_VERSION="$DEFAULT_NEXT_SNAPSHOT_VERSION"
+          if [[ "$NEXT_SNAPSHOT_VERSION" != *-SNAPSHOT ]]; then
+            NEXT_SNAPSHOT_VERSION="${NEXT_SNAPSHOT_VERSION}-SNAPSHOT"
+          fi
+          validate_semver "$NEXT_SNAPSHOT_VERSION"
+
+          TAG_NAME="$RELEASE_VERSION"
+          RELEASE_COMMAND="$MVN -B -ntp -f \"$PROJECT_DIR/pom.xml\" -Dtag=$TAG_NAME -DreleaseVersion=$RELEASE_VERSION -DdevelopmentVersion=$NEXT_SNAPSHOT_VERSION release:prepare release:perform"
+
+          {
+            echo "current_version=$CURRENT_VERSION"
+            echo "release_version=$RELEASE_VERSION"
+            echo "next_snapshot_version=$NEXT_SNAPSHOT_VERSION"
+            echo "tag_name=$TAG_NAME"
+            echo "release_command=$RELEASE_COMMAND"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release plan"
+            echo
+            echo "- Current version: \`$CURRENT_VERSION\`"
+            echo "- Release kind: \`$RELEASE_KIND\`"
+            echo "- Release version: \`$RELEASE_VERSION\`"
+            echo "- Next snapshot version: \`$NEXT_SNAPSHOT_VERSION\`"
+            echo "- Git tag: \`$TAG_NAME\`"
+            echo
+            echo "Command:"
+            echo
+            echo "\`\`\`bash"
+            echo "$RELEASE_COMMAND"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run maven-release-plugin
+        shell: bash
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ env.GPG_PASSPHRASE }}
+          MAVEN_GPG_KEY_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          RELEASE_ARGS="-DskipTests -Dquality.owasp.skip=true -Dsonar.skip=true"
+          RELEASE_PROFILES="release"
+
+          if [ "$RELEASE_SIGNING_ENABLED" = "true" ]; then
+            RELEASE_PROFILES="release,release-signing"
+            echo "GPG signing enabled for this release."
+          else
+            echo "GPG signing disabled for this project. Release artifacts will be published without signatures."
+          fi
+
+          echo "Running release command:"
+          echo "$MVN -B -ntp -f \"$PROJECT_DIR/pom.xml\" -Dtag=${{ steps.plan.outputs.tag_name }} -DreleaseVersion=${{ steps.plan.outputs.release_version }} -DdevelopmentVersion=${{ steps.plan.outputs.next_snapshot_version }} -DreleaseProfiles=$RELEASE_PROFILES -Darguments=\"$RELEASE_ARGS\" -Dusername=\"$SCM_USERNAME\" -Dpassword=\"***\" release:prepare release:perform"
+
+          "$MVN" -B -ntp -f "$PROJECT_DIR/pom.xml" release:clean
+          "$MVN" -B -ntp -f "$PROJECT_DIR/pom.xml" \
+            -Dtag="${{ steps.plan.outputs.tag_name }}" \
+            -DreleaseVersion="${{ steps.plan.outputs.release_version }}" \
+            -DdevelopmentVersion="${{ steps.plan.outputs.next_snapshot_version }}" \
+            -DreleaseProfiles="$RELEASE_PROFILES" \
+            -Darguments="$RELEASE_ARGS" \
+            -Dusername="$SCM_USERNAME" \
+            -Dpassword="$SCM_PASSWORD" \
+            release:prepare release:perform
+
+      - name: Verify release tag exists on origin
+        shell: bash
+        run: |
+          git ls-remote --exit-code --tags origin "refs/tags/${{ steps.plan.outputs.tag_name }}" >/dev/null
+
+      - name: Verify next snapshot commit exists on the branch
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            ROOT_MVN=./mvnw
+          else
+            ROOT_MVN=mvn
+          fi
+
+          VERIFY_WORKTREE="$RUNNER_TEMP/release-branch-verification"
+          rm -rf "$VERIFY_WORKTREE"
+          git fetch origin "${GITHUB_REF_NAME}" --depth=1
+          git worktree add --detach "$VERIFY_WORKTREE" "origin/${GITHUB_REF_NAME}"
+
+          if [ -f "$VERIFY_WORKTREE/mvnw" ]; then
+            chmod +x "$VERIFY_WORKTREE/mvnw"
+            VERIFY_MVN="$VERIFY_WORKTREE/mvnw"
+          else
+            VERIFY_MVN="$ROOT_MVN"
+          fi
+
+          BRANCH_VERSION=$("$VERIFY_MVN" -q -DforceStdout -f "$VERIFY_WORKTREE/$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+
+          if [ "$BRANCH_VERSION" != "${{ steps.plan.outputs.next_snapshot_version }}" ]; then
+            echo "::error::The release tag was pushed, but the default branch version is $BRANCH_VERSION instead of ${{ steps.plan.outputs.next_snapshot_version }}."
+            exit 1
+          fi
+
+      - name: Create GitHub release entry from tag
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = '${{ steps.plan.outputs.tag_name }}';
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag
+              });
+              core.info(`GitHub release ${tag} already exists.`);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: tag,
+                generate_release_notes: true,
+                target_commitish: context.ref.replace('refs/heads/', '')
+              });
+              core.info(`Created GitHub release entry for tag ${tag}.`);
+            }
