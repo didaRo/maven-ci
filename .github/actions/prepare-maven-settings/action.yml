@@ -1,0 +1,36 @@
+name: Prepare Maven settings
+description: Creates a Maven settings file from a shared XML secret.
+inputs:
+  settings_xml:
+    description: Raw Maven settings XML or a path to an existing settings.xml file.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Materialize settings.xml when configured
+      shell: bash
+      env:
+        SETTINGS_XML: ${{ inputs.settings_xml }}
+      run: |
+        set -euo pipefail
+
+        SETTINGS_DIR="$GITHUB_WORKSPACE/.m2"
+        SETTINGS_FILE="$SETTINGS_DIR/settings.xml"
+
+        mkdir -p "$SETTINGS_DIR"
+        rm -f "$SETTINGS_FILE"
+
+        if [ -n "$SETTINGS_XML" ]; then
+          if [ -f "$SETTINGS_XML" ]; then
+            cp "$SETTINGS_XML" "$SETTINGS_FILE"
+          else
+            printf '%s\n' "$SETTINGS_XML" > "$SETTINGS_FILE"
+          fi
+        fi
+
+        if [ -f "$SETTINGS_FILE" ]; then
+          echo "MAVEN_SETTINGS_FILE=$SETTINGS_FILE" >> "$GITHUB_ENV"
+        else
+          echo "MAVEN_SETTINGS_FILE=" >> "$GITHUB_ENV"
+        fi

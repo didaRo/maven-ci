@@ -1,0 +1,23 @@
+stages:
+  - verify
+  - quality
+  - security
+  - snapshot
+  - release
+  - catalog_release
+
+include:
+  - component: $CI_SERVER_FQDN/$CI_PROJECT_PATH/maven-ci@$CI_COMMIT_SHA
+    inputs:
+      project_dir: examples/spring-boot-actuator
+
+create-catalog-release:
+  stage: catalog_release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/'
+  script:
+    - echo "Creating GitLab CI/CD Catalog release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: "Release $CI_COMMIT_TAG of components in $CI_PROJECT_PATH"

@@ -1,0 +1,397 @@
+name: Reusable Maven Release
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: Directory containing the consumer pom.xml.
+        required: true
+        type: string
+      maven_repository_owner:
+        description: Owner used by settings.xml when it references MAVEN_REPOSITORY_OWNER.
+        required: false
+        default: ''
+        type: string
+      release_java_version:
+        description: Java version used by the release job.
+        required: false
+        default: '25'
+        type: string
+      release_signing_enabled:
+        description: Enable artifact signing during release.
+        required: false
+        default: false
+        type: boolean
+      release_kind:
+        description: How to compute the release version.
+        required: true
+        type: string
+      release_version:
+        description: Optional explicit release version.
+        required: false
+        default: ''
+        type: string
+      release_profile:
+        description: Maven profile activated during release.
+        required: false
+        default: release
+        type: string
+      release_args:
+        description: Arguments passed to release:perform.
+        required: false
+        default: -DskipTests -Dquality.owasp.skip=true -Dsonar.skip=true
+        type: string
+      next_snapshot_strategy:
+        description: Strategy used to compute the next development version when not explicitly provided.
+        required: false
+        default: patch
+        type: string
+    secrets:
+      maven_settings_xml:
+        required: false
+      release_pat:
+        required: false
+      gpg_private_key:
+        required: false
+      gpg_passphrase:
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Perform release
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_DIR: ${{ inputs.project_dir }}
+      MAVEN_REPOSITORY_OWNER: ${{ inputs.maven_repository_owner || github.actor }}
+      MAVEN_REPOSITORY_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      RELEASE_JAVA_VERSION: ${{ inputs.release_java_version }}
+      RELEASE_SIGNING_ENABLED: ${{ inputs.release_signing_enabled }}
+      RELEASE_PROFILE_INPUT: ${{ inputs.release_profile }}
+      RELEASE_ARGS_INPUT: ${{ inputs.release_args }}
+      NEXT_SNAPSHOT_STRATEGY: ${{ inputs.next_snapshot_strategy }}
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+      RELEASE_PAT: ${{ secrets.release_pat }}
+      GPG_PRIVATE_KEY: ${{ secrets.gpg_private_key }}
+      GPG_PASSPHRASE: ${{ secrets.gpg_passphrase }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+          persist-credentials: false
+
+      - name: Configure git identity for release commits
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Use release PAT when provided
+        if: ${{ env.RELEASE_PAT != '' }}
+        shell: bash
+        run: |
+          git remote set-url origin "https://x-access-token:${RELEASE_PAT}@github.com/${{ github.repository }}.git"
+
+      - name: Ensure local branch checkout for maven-release-plugin
+        shell: bash
+        run: |
+          git fetch origin "${GITHUB_REF_NAME}" --depth=1
+          git checkout -B "${GITHUB_REF_NAME}" "origin/${GITHUB_REF_NAME}"
+          git status --short --branch
+
+      - name: Resolve SCM credentials
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_PAT" ]; then
+            echo "SCM_USERNAME=x-access-token" >> "$GITHUB_ENV"
+            echo "SCM_PASSWORD=$RELEASE_PAT" >> "$GITHUB_ENV"
+          else
+            echo "SCM_USERNAME=$GITHUB_ACTOR" >> "$GITHUB_ENV"
+            echo "SCM_PASSWORD=$GITHUB_TOKEN" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.RELEASE_JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Require Maven settings for publication
+        shell: bash
+        run: |
+          if [ -z "${MAVEN_SETTINGS_FILE:-}" ] || [ ! -f "$MAVEN_SETTINGS_FILE" ]; then
+            echo "::error::MAVEN_SETTINGS_XML is required for release publication."
+            exit 1
+          fi
+
+      - name: Validate signing configuration
+        if: ${{ env.RELEASE_SIGNING_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::release_signing_enabled=true but gpg_private_key is not configured."
+            exit 1
+          fi
+
+          if [ -z "$GPG_PASSPHRASE" ]; then
+            echo "::error::release_signing_enabled=true but gpg_passphrase is not configured."
+            exit 1
+          fi
+
+      - name: Import GPG key (optional)
+        if: ${{ env.RELEASE_SIGNING_ENABLED == 'true' && env.GPG_PRIVATE_KEY != '' }}
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ env.GPG_PRIVATE_KEY }}
+          passphrase: ${{ env.GPG_PASSPHRASE }}
+
+      - name: Resolve release plan
+        id: plan
+        shell: bash
+        run: |
+          validate_semver() {
+            local version="$1"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?$ ]]; then
+              echo "Invalid semantic version: $version"
+              exit 1
+            fi
+          }
+
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          MVN_ARGS=(-q -DforceStdout)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          CURRENT_VERSION=$("$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+          if [[ "$CURRENT_VERSION" != *-SNAPSHOT ]]; then
+            echo "::error::Release requires a SNAPSHOT project version on the target branch, but found $CURRENT_VERSION."
+            exit 1
+          fi
+          CURRENT_BASE_VERSION="${CURRENT_VERSION%-SNAPSHOT}"
+          validate_semver "$CURRENT_BASE_VERSION"
+
+          evaluate_version_property() {
+            local expression="$1"
+            "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" build-helper:parse-version help:evaluate "-Dexpression=$expression" | tail -n 1
+          }
+
+          evaluate_release_version_property() {
+            local version_string="$1"
+            local expression="$2"
+            "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$version_string" help:evaluate "-Dexpression=$expression" | tail -n 1
+          }
+
+          CURRENT_MAJOR=$(evaluate_version_property "parsedVersion.majorVersion")
+          CURRENT_MINOR=$(evaluate_version_property "parsedVersion.minorVersion")
+          NEXT_MAJOR=$(evaluate_version_property "parsedVersion.nextMajorVersion")
+          NEXT_MINOR=$(evaluate_version_property "parsedVersion.nextMinorVersion")
+          NEXT_INCREMENTAL=$(evaluate_version_property "parsedVersion.nextIncrementalVersion")
+
+          RELEASE_KIND="${{ inputs.release_kind }}"
+          REQUESTED_RELEASE_VERSION="${{ inputs.release_version }}"
+          case "$RELEASE_KIND" in
+            current)
+              RELEASE_VERSION="$CURRENT_BASE_VERSION"
+              ;;
+            patch)
+              RELEASE_VERSION="${CURRENT_MAJOR}.${CURRENT_MINOR}.${NEXT_INCREMENTAL}"
+              ;;
+            minor)
+              RELEASE_VERSION="${CURRENT_MAJOR}.${NEXT_MINOR}.0"
+              ;;
+            major)
+              RELEASE_VERSION="${NEXT_MAJOR}.0.0"
+              ;;
+            custom)
+              if [ -z "$REQUESTED_RELEASE_VERSION" ]; then
+                echo "release_version is mandatory when release_kind=custom"
+                exit 1
+              fi
+              RELEASE_VERSION="$REQUESTED_RELEASE_VERSION"
+              ;;
+            *)
+              echo "Unsupported release_kind: $RELEASE_KIND"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "$REQUESTED_RELEASE_VERSION" ]; then
+            RELEASE_VERSION="$REQUESTED_RELEASE_VERSION"
+          fi
+
+          RELEASE_VERSION="${RELEASE_VERSION%-SNAPSHOT}"
+          validate_semver "$RELEASE_VERSION"
+          RELEASE_MAJOR=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.majorVersion")
+          RELEASE_MINOR=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.minorVersion")
+          RELEASE_NEXT_INCREMENTAL=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.nextIncrementalVersion")
+
+          if [ "$NEXT_SNAPSHOT_STRATEGY" = "minor" ]; then
+            RELEASE_NEXT_MINOR=$(evaluate_release_version_property "$RELEASE_VERSION" "parsedVersion.nextMinorVersion")
+            NEXT_SNAPSHOT_VERSION="${RELEASE_MAJOR}.${RELEASE_NEXT_MINOR}.0-SNAPSHOT"
+          else
+            NEXT_SNAPSHOT_VERSION="${RELEASE_MAJOR}.${RELEASE_MINOR}.${RELEASE_NEXT_INCREMENTAL}-SNAPSHOT"
+          fi
+          if [[ "$NEXT_SNAPSHOT_VERSION" != *-SNAPSHOT ]]; then
+            NEXT_SNAPSHOT_VERSION="${NEXT_SNAPSHOT_VERSION}-SNAPSHOT"
+          fi
+          validate_semver "$NEXT_SNAPSHOT_VERSION"
+
+          TAG_NAME="$RELEASE_VERSION"
+          SETTINGS_DISPLAY_ARG=""
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            SETTINGS_DISPLAY_ARG=" --settings \"$MAVEN_SETTINGS_FILE\""
+          fi
+          RELEASE_COMMAND="$MVN -B -ntp${SETTINGS_DISPLAY_ARG} -f \"$PROJECT_DIR/pom.xml\" -Dresume=false -Dtag=$TAG_NAME -DreleaseVersion=$RELEASE_VERSION -DdevelopmentVersion=$NEXT_SNAPSHOT_VERSION release:prepare release:perform"
+
+          {
+            echo "release_version=$RELEASE_VERSION"
+            echo "next_snapshot_version=$NEXT_SNAPSHOT_VERSION"
+            echo "tag_name=$TAG_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release plan"
+            echo
+            echo "- Current version: \`$CURRENT_VERSION\`"
+            echo "- Release kind: \`$RELEASE_KIND\`"
+            echo "- Release version: \`$RELEASE_VERSION\`"
+            echo "- Next snapshot version: \`$NEXT_SNAPSHOT_VERSION\`"
+            echo "- Git tag: \`$TAG_NAME\`"
+            echo
+            echo "Command:"
+            echo
+            echo "\`\`\`bash"
+            echo "$RELEASE_COMMAND"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run maven-release-plugin
+        shell: bash
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ env.GPG_PASSPHRASE }}
+          MAVEN_GPG_KEY_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          RELEASE_ARGS="$RELEASE_ARGS_INPUT"
+          RELEASE_PROFILES="$RELEASE_PROFILE_INPUT"
+          MVN_ARGS=(-B -ntp)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          if [ "$RELEASE_SIGNING_ENABLED" = "true" ]; then
+            RELEASE_PROFILES="${RELEASE_PROFILE_INPUT},release-signing"
+            echo "GPG signing enabled for this release."
+          else
+            echo "GPG signing disabled for this project. Release artifacts will be published without signatures."
+          fi
+
+          SETTINGS_DISPLAY_ARG=""
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            SETTINGS_DISPLAY_ARG=" --settings \"$MAVEN_SETTINGS_FILE\""
+          fi
+
+          echo "Running release command:"
+          echo "$MVN -B -ntp${SETTINGS_DISPLAY_ARG} -f \"$PROJECT_DIR/pom.xml\" -Dresume=false -Dtag=${{ steps.plan.outputs.tag_name }} -DreleaseVersion=${{ steps.plan.outputs.release_version }} -DdevelopmentVersion=${{ steps.plan.outputs.next_snapshot_version }} -DreleaseProfiles=$RELEASE_PROFILES -Darguments=\"$RELEASE_ARGS\" -Dusername=\"$SCM_USERNAME\" -Dpassword=\"***\" release:prepare release:perform"
+
+          "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" release:clean
+          "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" \
+            -Dresume=false \
+            -Dtag="${{ steps.plan.outputs.tag_name }}" \
+            -DreleaseVersion="${{ steps.plan.outputs.release_version }}" \
+            -DdevelopmentVersion="${{ steps.plan.outputs.next_snapshot_version }}" \
+            -DreleaseProfiles="$RELEASE_PROFILES" \
+            -Darguments="$RELEASE_ARGS" \
+            -Dusername="$SCM_USERNAME" \
+            -Dpassword="$SCM_PASSWORD" \
+            release:prepare release:perform
+
+      - name: Verify release tag exists on origin
+        shell: bash
+        run: |
+          git ls-remote --exit-code --tags origin "refs/tags/${{ steps.plan.outputs.tag_name }}" >/dev/null
+
+      - name: Verify next snapshot commit exists on the branch
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            ROOT_MVN=./mvnw
+          else
+            ROOT_MVN=mvn
+          fi
+
+          VERIFY_WORKTREE="$RUNNER_TEMP/release-branch-verification"
+          rm -rf "$VERIFY_WORKTREE"
+          git fetch origin "${GITHUB_REF_NAME}" --depth=1
+          git worktree add --detach "$VERIFY_WORKTREE" "origin/${GITHUB_REF_NAME}"
+
+          if [ -f "$VERIFY_WORKTREE/mvnw" ]; then
+            chmod +x "$VERIFY_WORKTREE/mvnw"
+            VERIFY_MVN="$VERIFY_WORKTREE/mvnw"
+          else
+            VERIFY_MVN="$ROOT_MVN"
+          fi
+
+          BRANCH_VERSION=$("$VERIFY_MVN" -q -DforceStdout -f "$VERIFY_WORKTREE/$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+
+          if [ "$BRANCH_VERSION" != "${{ steps.plan.outputs.next_snapshot_version }}" ]; then
+            echo "::error::The release tag was pushed, but the default branch version is $BRANCH_VERSION instead of ${{ steps.plan.outputs.next_snapshot_version }}."
+            exit 1
+          fi
+
+      - name: Create GitHub release entry from tag
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = '${{ steps.plan.outputs.tag_name }}';
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag
+              });
+              core.info(`GitHub release ${tag} already exists.`);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: tag,
+                generate_release_notes: true,
+                target_commitish: context.ref.replace('refs/heads/', '')
+              });
+              core.info(`Created GitHub release entry for tag ${tag}.`);
+            }

@@ -1,0 +1,111 @@
+name: Maven Snapshot Publish
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Maven Build, Test, Quality and Security
+    types:
+      - completed
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: maven-snapshot-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SNAPSHOT_BRANCH_REGEX: ${{ vars.CI_SNAPSHOT_BRANCH_REGEX || '^US[0-9][A-Za-z0-9._/-]*$' }}
+
+jobs:
+  auto_snapshot_policy:
+    name: Automatic snapshot policy
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_run' }}
+    outputs:
+      should_publish: ${{ steps.policy.outputs.should_publish }}
+      target_ref: ${{ steps.policy.outputs.target_ref }}
+      target_branch: ${{ steps.policy.outputs.target_branch }}
+    steps:
+      - name: Evaluate branch policy
+        id: policy
+        shell: bash
+        env:
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_EVENT: ${{ github.event.workflow_run.event }}
+          TARGET_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TARGET_REF: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          echo "target_ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
+          if [ "$WORKFLOW_CONCLUSION" != "success" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Automatic snapshot skipped because validation did not succeed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$WORKFLOW_EVENT" != "push" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Automatic snapshot skipped because validation was triggered by $WORKFLOW_EVENT instead of push." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$TARGET_BRANCH" =~ $SNAPSHOT_BRANCH_REGEX ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Automatic snapshot enabled for branch $TARGET_BRANCH." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Automatic snapshot skipped because branch $TARGET_BRANCH does not match CI_SNAPSHOT_BRANCH_REGEX=$SNAPSHOT_BRANCH_REGEX." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  auto_snapshot:
+    name: Automatic Spring Boot snapshot
+    if: ${{ github.event_name == 'workflow_run' && needs.auto_snapshot_policy.outputs.should_publish == 'true' }}
+    needs: auto_snapshot_policy
+    uses: ./.github/workflows/reusable-maven-snapshot.yml
+    with:
+      project_dir: ${{ vars.CI_PROJECT_DIR || 'examples/spring-boot-actuator' }}
+      maven_repository_owner: ${{ vars.MAVEN_REPOSITORY_OWNER || '' }}
+      build_java_version: ${{ vars.CI_BUILD_JAVA_VERSION || '25' }}
+      target_ref: ${{ needs.auto_snapshot_policy.outputs.target_ref }}
+      target_branch: ${{ needs.auto_snapshot_policy.outputs.target_branch }}
+      snapshot_args: ${{ vars.CI_SNAPSHOT_ARGS || '-DskipTests' }}
+    secrets:
+      maven_settings_xml: ${{ secrets.MAVEN_SETTINGS_XML }}
+
+  manual_snapshot_guard:
+    name: Manual snapshot guard
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Checkout workflow sources
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Ensure validation workflow is green on this commit
+        uses: ./.github/actions/require-workflow-success
+        with:
+          workflow_path: .github/workflows/maven-ci.yml
+          workflow_label: Maven Build, Test, Quality and Security
+          branch: ${{ github.ref_name }}
+          sha: ${{ github.sha }}
+          event: push
+
+  manual_snapshot:
+    name: Manual Spring Boot snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: manual_snapshot_guard
+    uses: ./.github/workflows/reusable-maven-snapshot.yml
+    with:
+      project_dir: ${{ vars.CI_PROJECT_DIR || 'examples/spring-boot-actuator' }}
+      maven_repository_owner: ${{ vars.MAVEN_REPOSITORY_OWNER || '' }}
+      build_java_version: ${{ vars.CI_BUILD_JAVA_VERSION || '25' }}
+      target_ref: ${{ github.sha }}
+      target_branch: ${{ github.ref_name }}
+      snapshot_args: ${{ vars.CI_SNAPSHOT_ARGS || '-DskipTests' }}
+    secrets:
+      maven_settings_xml: ${{ secrets.MAVEN_SETTINGS_XML }}

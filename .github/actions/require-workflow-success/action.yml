@@ -1,0 +1,85 @@
+name: Require Workflow Success
+description: Ensure a workflow run succeeded for a given branch and commit.
+inputs:
+  workflow_path:
+    description: Workflow file path, for example .github/workflows/maven-ci.yml
+    required: true
+  workflow_label:
+    description: Human-friendly workflow label used in messages.
+    required: false
+    default: ''
+  branch:
+    description: Branch name to inspect.
+    required: true
+  sha:
+    description: Commit SHA that must have a successful workflow run.
+    required: true
+  event:
+    description: GitHub event name used to filter workflow runs.
+    required: false
+    default: push
+runs:
+  using: composite
+  steps:
+    - name: Ensure referenced workflow run is green
+      uses: actions/github-script@v8
+      env:
+        WORKFLOW_PATH: ${{ inputs.workflow_path }}
+        WORKFLOW_LABEL: ${{ inputs.workflow_label }}
+        TARGET_BRANCH: ${{ inputs.branch }}
+        TARGET_SHA: ${{ inputs.sha }}
+        TARGET_EVENT: ${{ inputs.event }}
+      with:
+        script: |
+          const workflowPath = process.env.WORKFLOW_PATH;
+          const workflowLabel = process.env.WORKFLOW_LABEL || workflowPath;
+          const branch = process.env.TARGET_BRANCH;
+          const sha = process.env.TARGET_SHA;
+          const event = process.env.TARGET_EVENT || 'push';
+          const { owner, repo } = context.repo;
+
+          if (!workflowPath) {
+            core.setFailed('workflow_path input is required.');
+            return;
+          }
+          if (!branch) {
+            core.setFailed('branch input is required.');
+            return;
+          }
+          if (!sha) {
+            core.setFailed('sha input is required.');
+            return;
+          }
+
+          const workflows = await github.rest.actions.listRepoWorkflows({
+            owner,
+            repo,
+            per_page: 100
+          });
+
+          const workflow = workflows.data.workflows.find((candidate) => candidate.path === workflowPath);
+          if (!workflow) {
+            core.setFailed(`Workflow "${workflowLabel}" (${workflowPath}) not found in ${owner}/${repo}.`);
+            return;
+          }
+
+          const runs = await github.rest.actions.listWorkflowRuns({
+            owner,
+            repo,
+            workflow_id: workflow.id,
+            branch,
+            event,
+            per_page: 100
+          });
+
+          const matchedRun = runs.data.workflow_runs.find((candidate) => candidate.head_sha === sha);
+          if (!matchedRun) {
+            core.setFailed(`No "${workflowLabel}" ${event} run was found for commit ${sha} on branch ${branch}. Push the commit and wait for validation before continuing.`);
+            return;
+          }
+
+          core.info(`Matched ${workflowLabel} run #${matchedRun.run_number} with status=${matchedRun.status} conclusion=${matchedRun.conclusion}`);
+
+          if (matchedRun.status !== 'completed' || matchedRun.conclusion !== 'success') {
+            core.setFailed(`"${workflowLabel}" must be fully green before continuing. Current status=${matchedRun.status}, conclusion=${matchedRun.conclusion}.`);
+          }

@@ -1,0 +1,173 @@
+spec:
+  description: Publish Maven snapshots after a successful validation flow.
+  inputs:
+    job_prefix:
+      description: Prefix used for the generated job names.
+      regex: ^[a-z0-9][a-z0-9_]{0,62}$
+      default: maven
+    image:
+      description: Container image used by the snapshot jobs.
+      regex: ^[^\r\n]+$
+      default: maven:3.9.6-eclipse-temurin-21
+    runner_tags:
+      description: Optional GitLab runner tags applied to every generated job.
+      type: array
+      default: []
+    snapshot_stage:
+      description: Stage used for snapshot publication.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: snapshot
+    snapshot_needs:
+      description: Optional DAG dependencies injected into the automatic and manual snapshot jobs.
+      type: array
+      default: []
+    project_dir:
+      description: Directory containing the consumer pom.xml.
+      regex: ^[^\r\n]+$
+      default: .
+    maven_opts:
+      description: Maven JVM options, including the local repository path.
+      regex: ^[^\r\n]*$
+      default: -Dmaven.repo.local=.m2/repository
+    maven_cli_opts:
+      description: Additional Maven CLI options.
+      regex: ^[^\r\n]*$
+      default: -B -ntp
+    enable_auto_snapshot:
+      description: Enable automatic snapshot publication on push pipelines.
+      type: boolean
+      default: true
+    enable_manual_snapshot:
+      description: Expose the manual snapshot job in the pipeline UI.
+      type: boolean
+      default: true
+    snapshot_branch_regex:
+      description: Regex used to detect user story branches for automatic snapshot publication.
+      regex: ^[^\r\n]+$
+      default: ^US[0-9][A-Za-z0-9._/-]*$
+    manual_any_branch:
+      description: Allow manual snapshot publication on any branch.
+      type: boolean
+      default: false
+    snapshot_args:
+      description: Extra Maven arguments appended to the snapshot deploy command.
+      regex: ^[^\r\n]*$
+      default: -DskipTests
+---
+".maven_snapshot_$[[ inputs.job_prefix ]]_base":
+  image: $[[ inputs.image ]]
+  tags: $[[ inputs.runner_tags ]]
+  before_script:
+    - |
+      if [ -f ./mvnw ]; then
+        chmod +x ./mvnw
+        MVN=./mvnw
+      else
+        MVN=mvn
+      fi
+      export MVN
+    - |
+      mkdir -p .m2
+
+      if [ -n "${MAVEN_SETTINGS_XML:-}" ]; then
+        if [ -f "$MAVEN_SETTINGS_XML" ]; then
+          cp "$MAVEN_SETTINGS_XML" .m2/settings.xml
+        else
+          printf '%s\n' "$MAVEN_SETTINGS_XML" > .m2/settings.xml
+        fi
+      fi
+
+      if [ -f .m2/settings.xml ]; then
+        case " ${MAVEN_CLI_OPTS:-} " in
+          *" --settings .m2/settings.xml "*) ;;
+          *) export MAVEN_CLI_OPTS="${MAVEN_CLI_OPTS:-} --settings .m2/settings.xml" ;;
+        esac
+      fi
+  variables:
+    PROJECT_DIR: "$[[ inputs.project_dir ]]"
+    MAVEN_OPTS: "$[[ inputs.maven_opts ]]"
+    MAVEN_CLI_OPTS: "$[[ inputs.maven_cli_opts ]]"
+    ENABLE_AUTO_SNAPSHOT: "$[[ inputs.enable_auto_snapshot ]]"
+    ENABLE_MANUAL_SNAPSHOT: "$[[ inputs.enable_manual_snapshot ]]"
+    SNAPSHOT_BRANCH_REGEX: "$[[ inputs.snapshot_branch_regex ]]"
+    MANUAL_ANY_BRANCH: "$[[ inputs.manual_any_branch ]]"
+    SNAPSHOT_ARGS: "$[[ inputs.snapshot_args ]]"
+  cache:
+    key: "$CI_PROJECT_NAME-m2"
+    paths:
+      - .m2/repository
+
+"$[[ inputs.job_prefix ]]_snapshot_publish_auto":
+  extends: ".maven_snapshot_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.snapshot_stage ]]
+  needs: $[[ inputs.snapshot_needs ]]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - when: never
+  script:
+    - |
+      if [ ! -f .m2/settings.xml ]; then
+        echo "MAVEN_SETTINGS_XML is required for snapshot publication."
+        exit 1
+      fi
+
+      if [ "$ENABLE_AUTO_SNAPSHOT" != "true" ]; then
+        echo "Automatic snapshot publication is disabled."
+        exit 0
+      fi
+
+      if ! printf '%s' "${CI_COMMIT_BRANCH:-}" | grep -Eq "$SNAPSHOT_BRANCH_REGEX"; then
+        echo "Branch ${CI_COMMIT_BRANCH:-unknown} does not match SNAPSHOT_BRANCH_REGEX=$SNAPSHOT_BRANCH_REGEX. Nothing to publish."
+        exit 0
+      fi
+
+      current_version=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+      case "$current_version" in
+        *-SNAPSHOT) ;;
+        *)
+          echo "Current version $current_version is not a SNAPSHOT. Nothing to publish."
+          exit 0
+          ;;
+      esac
+
+      echo "Publishing snapshot $current_version from branch ${CI_COMMIT_BRANCH:-unknown}"
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" deploy $SNAPSHOT_ARGS
+
+"$[[ inputs.job_prefix ]]_snapshot_publish_manual":
+  extends: ".maven_snapshot_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.snapshot_stage ]]
+  needs: $[[ inputs.snapshot_needs ]]
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+      when: manual
+    - when: never
+  allow_failure: false
+  script:
+    - |
+      if [ ! -f .m2/settings.xml ]; then
+        echo "MAVEN_SETTINGS_XML is required for snapshot publication."
+        exit 1
+      fi
+
+      if [ "$ENABLE_MANUAL_SNAPSHOT" != "true" ]; then
+        echo "Manual snapshot publication is disabled."
+        exit 0
+      fi
+
+      if [ "$MANUAL_ANY_BRANCH" != "true" ] && [ "${CI_COMMIT_BRANCH:-}" != "${CI_DEFAULT_BRANCH:-}" ] && ! printf '%s' "${CI_COMMIT_BRANCH:-}" | grep -Eq "$SNAPSHOT_BRANCH_REGEX"; then
+        echo "Manual snapshot is allowed only on the default branch or on branches matching SNAPSHOT_BRANCH_REGEX=$SNAPSHOT_BRANCH_REGEX."
+        exit 0
+      fi
+
+      current_version=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+      case "$current_version" in
+        *-SNAPSHOT) ;;
+        *)
+          echo "Current version $current_version is not a SNAPSHOT. Nothing to publish."
+          exit 0
+          ;;
+      esac
+
+      echo "Publishing snapshot $current_version from branch ${CI_COMMIT_BRANCH:-unknown}"
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" deploy $SNAPSHOT_ARGS

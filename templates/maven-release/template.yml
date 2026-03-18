@@ -1,0 +1,168 @@
+spec:
+  description: Run a Maven release from the protected default branch with maven-release-plugin.
+  inputs:
+    job_prefix:
+      description: Prefix used for the generated job name.
+      regex: ^[a-z0-9][a-z0-9_]{0,62}$
+      default: maven
+    image:
+      description: Container image used by the release job.
+      regex: ^[^\r\n]+$
+      default: maven:3.9.6-eclipse-temurin-21
+    runner_tags:
+      description: Optional GitLab runner tags applied to the release job.
+      type: array
+      default: []
+    release_stage:
+      description: Stage used for the release job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: release
+    release_needs:
+      description: Optional DAG dependencies injected into the release job.
+      type: array
+      default: []
+    project_dir:
+      description: Directory containing the consumer pom.xml.
+      regex: ^[^\r\n]+$
+      default: .
+    maven_opts:
+      description: Maven JVM options, including the local repository path.
+      regex: ^[^\r\n]*$
+      default: -Dmaven.repo.local=.m2/repository
+    maven_cli_opts:
+      description: Additional Maven CLI options.
+      regex: ^[^\r\n]*$
+      default: -B -ntp
+    git_depth:
+      description: Git depth used by the release job. Keep 0 when you need full history and tags.
+      type: number
+      default: 0
+    release_profile:
+      description: Maven profile activated during release:perform.
+      regex: ^[A-Za-z0-9_.-]+$
+      default: release
+    release_args:
+      description: Arguments passed to maven-release-plugin perform goals.
+      regex: ^[^\r\n]*$
+      default: -DskipTests -Dquality.owasp.skip=true -Dsonar.skip=true
+    next_snapshot_strategy:
+      description: Strategy used when NEXT_SNAPSHOT_VERSION is not provided.
+      options:
+        - patch
+        - minor
+      default: patch
+---
+".maven_release_$[[ inputs.job_prefix ]]_base":
+  image: $[[ inputs.image ]]
+  tags: $[[ inputs.runner_tags ]]
+  before_script:
+    - |
+      if [ -f ./mvnw ]; then
+        chmod +x ./mvnw
+        MVN=./mvnw
+      else
+        MVN=mvn
+      fi
+      export MVN
+    - |
+      mkdir -p .m2
+
+      if [ -n "${MAVEN_SETTINGS_XML:-}" ]; then
+        if [ -f "$MAVEN_SETTINGS_XML" ]; then
+          cp "$MAVEN_SETTINGS_XML" .m2/settings.xml
+        else
+          printf '%s\n' "$MAVEN_SETTINGS_XML" > .m2/settings.xml
+        fi
+      fi
+
+      if [ -f .m2/settings.xml ]; then
+        case " ${MAVEN_CLI_OPTS:-} " in
+          *" --settings .m2/settings.xml "*) ;;
+          *) export MAVEN_CLI_OPTS="${MAVEN_CLI_OPTS:-} --settings .m2/settings.xml" ;;
+        esac
+      fi
+  variables:
+    GIT_DEPTH: "$[[ inputs.git_depth ]]"
+    PROJECT_DIR: "$[[ inputs.project_dir ]]"
+    MAVEN_OPTS: "$[[ inputs.maven_opts ]]"
+    MAVEN_CLI_OPTS: "$[[ inputs.maven_cli_opts ]]"
+    RELEASE_PROFILE: "$[[ inputs.release_profile ]]"
+    RELEASE_ARGS: "$[[ inputs.release_args ]]"
+    NEXT_SNAPSHOT_STRATEGY: "$[[ inputs.next_snapshot_strategy ]]"
+  cache:
+    key: "$CI_PROJECT_NAME-m2"
+    paths:
+      - .m2/repository
+
+"$[[ inputs.job_prefix ]]_release":
+  extends: ".maven_release_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.release_stage ]]
+  needs: $[[ inputs.release_needs ]]
+  resource_group: $[[ inputs.job_prefix ]]_release
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+    - when: never
+  script:
+    - |
+      if [ ! -f .m2/settings.xml ]; then
+        echo "MAVEN_SETTINGS_XML is required for release publication."
+        exit 1
+      fi
+
+      if [ "${CI_COMMIT_BRANCH:-}" != "${CI_DEFAULT_BRANCH:-}" ]; then
+        echo "Release is allowed only from the default branch."
+        exit 1
+      fi
+
+      if [ "${CI_COMMIT_REF_PROTECTED:-false}" != "true" ]; then
+        echo "Release requires a protected default branch."
+        exit 1
+      fi
+
+      if [ -n "${RELEASE_PUSH_TOKEN:-}" ]; then
+        git remote set-url origin "https://oauth2:${RELEASE_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      else
+        echo "RELEASE_PUSH_TOKEN is not configured. Release will rely on the runner checkout credentials."
+      fi
+
+      git fetch --tags origin "$CI_COMMIT_BRANCH"
+      git config user.name "${GITLAB_USER_NAME:-gitlab-ci}"
+      git config user.email "${GITLAB_USER_EMAIL:-gitlab-ci@example.com}"
+      git checkout -B "$CI_COMMIT_BRANCH" "$CI_COMMIT_SHA"
+
+      current_version=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+      current_base_version="${current_version%-SNAPSHOT}"
+      release_version="${RELEASE_VERSION:-$current_base_version}"
+      release_version="${release_version%-SNAPSHOT}"
+
+      if [ -z "${NEXT_SNAPSHOT_VERSION:-}" ]; then
+        release_major=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$release_version" help:evaluate -Dexpression=parsedVersion.majorVersion | tail -n 1)
+        release_minor=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$release_version" help:evaluate -Dexpression=parsedVersion.minorVersion | tail -n 1)
+        release_next_incremental=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$release_version" help:evaluate -Dexpression=parsedVersion.nextIncrementalVersion | tail -n 1)
+        release_next_minor=$($MVN -q -DforceStdout $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" build-helper:parse-version "-DversionString=$release_version" help:evaluate -Dexpression=parsedVersion.nextMinorVersion | tail -n 1)
+
+        if [ "$NEXT_SNAPSHOT_STRATEGY" = "minor" ]; then
+          next_snapshot_version="${release_major}.${release_next_minor}.0-SNAPSHOT"
+        else
+          next_snapshot_version="${release_major}.${release_minor}.${release_next_incremental}-SNAPSHOT"
+        fi
+      else
+        next_snapshot_version="${NEXT_SNAPSHOT_VERSION%-SNAPSHOT}-SNAPSHOT"
+      fi
+
+      echo "Release plan"
+      echo "  current version: $current_version"
+      echo "  release version: $release_version"
+      echo "  next snapshot:   $next_snapshot_version"
+      echo "  git tag:         $release_version"
+      echo "  release profile: $RELEASE_PROFILE"
+
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" release:clean
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" \
+        -Dtag="$release_version" \
+        -DreleaseVersion="$release_version" \
+        -DdevelopmentVersion="$next_snapshot_version" \
+        -DreleaseProfiles="$RELEASE_PROFILE" \
+        -Darguments="$RELEASE_ARGS" \
+        release:prepare release:perform

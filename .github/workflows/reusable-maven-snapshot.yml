@@ -1,0 +1,130 @@
+name: Reusable Maven Snapshot Publish
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: Directory containing the consumer pom.xml.
+        required: true
+        type: string
+      maven_repository_owner:
+        description: Owner used by settings.xml when it references MAVEN_REPOSITORY_OWNER.
+        required: false
+        default: ''
+        type: string
+      build_java_version:
+        description: Java version used for snapshot publication.
+        required: false
+        default: '25'
+        type: string
+      target_ref:
+        description: Commit SHA or ref to publish.
+        required: true
+        type: string
+      target_branch:
+        description: Branch associated with the publication.
+        required: false
+        default: ''
+        type: string
+      snapshot_args:
+        description: Arguments passed to the Maven deploy command.
+        required: false
+        default: -DskipTests
+        type: string
+    secrets:
+      maven_settings_xml:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  snapshot:
+    name: Deploy SNAPSHOT to GitHub Packages
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_DIR: ${{ inputs.project_dir }}
+      MAVEN_REPOSITORY_OWNER: ${{ inputs.maven_repository_owner || github.actor }}
+      MAVEN_REPOSITORY_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      BUILD_JAVA_VERSION: ${{ inputs.build_java_version }}
+      TARGET_BRANCH: ${{ inputs.target_branch }}
+      SNAPSHOT_ARGS: ${{ inputs.snapshot_args }}
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.BUILD_JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Require Maven settings for publication
+        shell: bash
+        run: |
+          if [ -z "${MAVEN_SETTINGS_FILE:-}" ] || [ ! -f "$MAVEN_SETTINGS_FILE" ]; then
+            echo "::error::MAVEN_SETTINGS_XML is required for snapshot publication."
+            exit 1
+          fi
+
+      - name: Detect project version
+        id: version
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          MVN_ARGS=(-q -DforceStdout)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          VERSION=$("$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" help:evaluate -Dexpression=project.version | tail -n 1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [[ "$VERSION" == *-SNAPSHOT ]]; then
+            echo "is_snapshot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_snapshot=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy snapshot
+        if: ${{ steps.version.outputs.is_snapshot == 'true' }}
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          echo "Publishing snapshot ${{ steps.version.outputs.version }} from branch ${TARGET_BRANCH:-unknown}"
+          MVN_ARGS=(-B -ntp)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" -Djava.version="$BUILD_JAVA_VERSION" deploy $SNAPSHOT_ARGS
+
+      - name: Skip non-SNAPSHOT
+        if: ${{ steps.version.outputs.is_snapshot != 'true' }}
+        shell: bash
+        run: |
+          echo "Version ${{ steps.version.outputs.version }} is not a SNAPSHOT. Snapshot publish skipped."

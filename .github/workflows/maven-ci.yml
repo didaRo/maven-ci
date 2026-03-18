@@ -1,0 +1,58 @@
+name: Maven Build, Test, Quality and Security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  security-events: write
+
+concurrency:
+  group: maven-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_test_quality:
+    name: Spring Boot witness
+    uses: ./.github/workflows/reusable-maven-build-test-quality.yml
+    with:
+      project_dir: ${{ vars.CI_PROJECT_DIR || 'examples/spring-boot-actuator' }}
+      maven_repository_owner: ${{ vars.MAVEN_REPOSITORY_OWNER || '' }}
+      build_java_version: ${{ vars.CI_BUILD_JAVA_VERSION || '25' }}
+      java_matrix: ${{ vars.CI_JAVA_MATRIX || '["25"]' }}
+      coverage_minimum: ${{ vars.CI_COVERAGE_MINIMUM || '85' }}
+      coverage_max_drop_percent: ${{ vars.CI_COVERAGE_MAX_DROP_PERCENT || '5' }}
+      coverage_allow_failure: ${{ vars.CI_COVERAGE_ALLOW_FAILURE == 'true' }}
+      sonar_enabled: ${{ vars.CI_ENABLE_SONAR != 'false' }}
+      sonar_allow_failure: ${{ vars.CI_SONAR_ALLOW_FAILURE == 'true' }}
+      sonar_organization: ${{ vars.SONAR_ORGANIZATION || '' }}
+      sonar_project_key: ${{ vars.SONAR_PROJECT_KEY || '' }}
+      owasp_enabled: ${{ vars.CI_ENABLE_OWASP != 'false' }}
+      owasp_allow_failure: ${{ vars.CI_OWASP_ALLOW_FAILURE == 'true' }}
+      owasp_mode: ${{ vars.CI_OWASP_MODE || 'auto' }}
+      owasp_allow_without_nvd_api_key: ${{ vars.CI_OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true' }}
+      owasp_fail_cvss: ${{ vars.CI_OWASP_FAIL_CVSS || '9.0' }}
+      owasp_nvd_valid_hours: ${{ vars.CI_OWASP_NVD_VALID_HOURS || '24' }}
+      owasp_nvd_datafeed_url: ${{ vars.CI_OWASP_NVD_DATAFEED_URL || '' }}
+      owasp_nvd_datafeed_server_id: ${{ vars.CI_OWASP_NVD_DATAFEED_SERVER_ID || 'owasp-nvd' }}
+      owasp_hosted_suppressions_url: ${{ vars.CI_OWASP_HOSTED_SUPPRESSIONS_URL || '' }}
+      owasp_hosted_suppressions_server_id: ${{ vars.CI_OWASP_HOSTED_SUPPRESSIONS_SERVER_ID || 'owasp-suppressions' }}
+      owasp_retirejs_url: ${{ vars.CI_OWASP_RETIREJS_URL || '' }}
+      owasp_retirejs_server_id: ${{ vars.CI_OWASP_RETIREJS_SERVER_ID || 'owasp-retirejs' }}
+      owasp_known_exploited_url: ${{ vars.CI_OWASP_KNOWN_EXPLOITED_URL || '' }}
+      owasp_known_exploited_server_id: ${{ vars.CI_OWASP_KNOWN_EXPLOITED_SERVER_ID || 'owasp-known-exploited' }}
+    secrets:
+      maven_settings_xml: ${{ secrets.MAVEN_SETTINGS_XML }}
+      sonar_token: ${{ secrets.SONAR_TOKEN }}
+      nvd_api_key: ${{ secrets.NVD_API_KEY }}
+      owasp_nvd_username: ${{ secrets.OWASP_NVD_USERNAME }}
+      owasp_nvd_password: ${{ secrets.OWASP_NVD_PASSWORD }}
+      owasp_hosted_suppressions_username: ${{ secrets.OWASP_HOSTED_SUPPRESSIONS_USERNAME }}
+      owasp_hosted_suppressions_password: ${{ secrets.OWASP_HOSTED_SUPPRESSIONS_PASSWORD }}
+      owasp_retirejs_username: ${{ secrets.OWASP_RETIREJS_USERNAME }}
+      owasp_retirejs_password: ${{ secrets.OWASP_RETIREJS_PASSWORD }}
+      owasp_known_exploited_username: ${{ secrets.OWASP_KNOWN_EXPLOITED_USERNAME }}
+      owasp_known_exploited_password: ${{ secrets.OWASP_KNOWN_EXPLOITED_PASSWORD }}

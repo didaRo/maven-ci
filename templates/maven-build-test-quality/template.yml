@@ -1,0 +1,188 @@
+spec:
+  description: Build, test, quality, and security checks for Maven projects.
+  inputs:
+    job_prefix:
+      description: Prefix used for the generated job names.
+      regex: ^[a-z0-9][a-z0-9_]{0,62}$
+      default: maven
+    image:
+      description: Container image used by the component jobs.
+      regex: ^[^\r\n]+$
+      default: maven:3.9.6-eclipse-temurin-21
+    runner_tags:
+      description: Optional GitLab runner tags applied to every generated job.
+      type: array
+      default: []
+    verify_stage:
+      description: Stage used for mvn clean verify.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: verify
+    quality_stage:
+      description: Stage used for the Sonar job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: quality
+    security_stage:
+      description: Stage used for the OWASP job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: quality
+    verify_needs:
+      description: Optional DAG dependencies injected into the build and test job.
+      type: array
+      default: []
+    quality_needs:
+      description: Optional DAG dependencies injected into the Sonar and OWASP jobs.
+      type: array
+      default: []
+    project_dir:
+      description: Directory containing the consumer pom.xml.
+      regex: ^[^\r\n]+$
+      default: .
+    maven_opts:
+      description: Maven JVM options, including the local repository path.
+      regex: ^[^\r\n]*$
+      default: -Dmaven.repo.local=.m2/repository
+    maven_cli_opts:
+      description: Additional Maven CLI options.
+      regex: ^[^\r\n]*$
+      default: -B -ntp
+    enable_sonar:
+      description: Enable the Sonar job when Sonar variables are configured.
+      type: boolean
+      default: false
+    sonar_allow_failure:
+      description: Mark the Sonar job as optional.
+      type: boolean
+      default: true
+    enable_owasp:
+      description: Enable OWASP dependency-check.
+      type: boolean
+      default: true
+    owasp_allow_failure:
+      description: Mark the OWASP job as optional.
+      type: boolean
+      default: false
+    owasp_allow_without_nvd_api_key:
+      description: Force OWASP even when NVD_API_KEY is not configured.
+      type: boolean
+      default: false
+    owasp_fail_cvss:
+      description: CVSS threshold used by OWASP dependency-check.
+      default: '9.0'
+    owasp_nvd_valid_hours:
+      description: Cache validity in hours for OWASP NVD data.
+      default: '24'
+---
+".maven_build_test_quality_$[[ inputs.job_prefix ]]_base":
+  image: $[[ inputs.image ]]
+  tags: $[[ inputs.runner_tags ]]
+  before_script:
+    - |
+      if [ -f ./mvnw ]; then
+        chmod +x ./mvnw
+        MVN=./mvnw
+      else
+        MVN=mvn
+      fi
+      export MVN
+    - |
+      mkdir -p .m2
+
+      if [ -n "${MAVEN_SETTINGS_XML:-}" ]; then
+        if [ -f "$MAVEN_SETTINGS_XML" ]; then
+          cp "$MAVEN_SETTINGS_XML" .m2/settings.xml
+        else
+          printf '%s\n' "$MAVEN_SETTINGS_XML" > .m2/settings.xml
+        fi
+      fi
+
+      if [ -f .m2/settings.xml ]; then
+        case " ${MAVEN_CLI_OPTS:-} " in
+          *" --settings .m2/settings.xml "*) ;;
+          *) export MAVEN_CLI_OPTS="${MAVEN_CLI_OPTS:-} --settings .m2/settings.xml" ;;
+        esac
+      fi
+  variables:
+    PROJECT_DIR: "$[[ inputs.project_dir ]]"
+    MAVEN_OPTS: "$[[ inputs.maven_opts ]]"
+    MAVEN_CLI_OPTS: "$[[ inputs.maven_cli_opts ]]"
+    ENABLE_SONAR: "$[[ inputs.enable_sonar ]]"
+    ENABLE_OWASP: "$[[ inputs.enable_owasp ]]"
+    OWASP_ALLOW_WITHOUT_NVD_API_KEY: "$[[ inputs.owasp_allow_without_nvd_api_key ]]"
+    OWASP_FAIL_CVSS: "$[[ inputs.owasp_fail_cvss ]]"
+    OWASP_NVD_VALID_HOURS: "$[[ inputs.owasp_nvd_valid_hours ]]"
+  cache:
+    key: "$CI_PROJECT_NAME-m2"
+    paths:
+      - .m2/repository
+      - .m2/dependency-check-data
+
+"$[[ inputs.job_prefix ]]_build_test":
+  extends: ".maven_build_test_quality_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.verify_stage ]]
+  needs: $[[ inputs.verify_needs ]]
+  script:
+    - $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" clean verify
+  artifacts:
+    when: always
+    paths:
+      - ${PROJECT_DIR}/target
+    reports:
+      junit:
+        - ${PROJECT_DIR}/target/surefire-reports/*.xml
+        - ${PROJECT_DIR}/target/failsafe-reports/*.xml
+
+"$[[ inputs.job_prefix ]]_sonar_quality":
+  extends: ".maven_build_test_quality_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.quality_stage ]]
+  needs: $[[ inputs.quality_needs ]]
+  allow_failure: $[[ inputs.sonar_allow_failure ]]
+  script:
+    - |
+      if [ "$ENABLE_SONAR" != "true" ]; then
+        echo "Sonar skipped because enable_sonar=false."
+        exit 0
+      fi
+
+      if [ -z "${SONAR_PROJECT_KEY:-}" ] || [ -z "${SONAR_TOKEN:-}" ]; then
+        echo "Sonar skipped. Configure SONAR_PROJECT_KEY and SONAR_TOKEN to enable it."
+        exit 0
+      fi
+
+      sonar_host_url="${SONAR_HOST_URL:-https://sonarcloud.io}"
+      sonar_org_arg=""
+      if [ -n "${SONAR_ORGANIZATION:-}" ]; then
+        sonar_org_arg="-Dsonar.organization=$SONAR_ORGANIZATION"
+      fi
+
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" \
+        -DskipTests \
+        -Dsonar.host.url="$sonar_host_url" \
+        -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+        $sonar_org_arg \
+        sonar:sonar
+
+"$[[ inputs.job_prefix ]]_owasp_security":
+  extends: ".maven_build_test_quality_$[[ inputs.job_prefix ]]_base"
+  stage: $[[ inputs.security_stage ]]
+  needs: $[[ inputs.quality_needs ]]
+  allow_failure: $[[ inputs.owasp_allow_failure ]]
+  script:
+    - |
+      if [ "$ENABLE_OWASP" != "true" ]; then
+        echo "OWASP skipped because enable_owasp=false."
+        exit 0
+      fi
+
+      if [ -z "${NVD_API_KEY:-}" ] && [ "$OWASP_ALLOW_WITHOUT_NVD_API_KEY" != "true" ]; then
+        echo "OWASP skipped. Configure NVD_API_KEY or set owasp_allow_without_nvd_api_key=true."
+        exit 0
+      fi
+
+      $MVN $MAVEN_CLI_OPTS -f "$PROJECT_DIR/pom.xml" \
+        -Psecurity \
+        -DskipTests \
+        -Dquality.owasp.skip=false \
+        -Dquality.owasp.fail.cvss="$OWASP_FAIL_CVSS" \
+        -Dquality.owasp.nvd.valid.hours="$OWASP_NVD_VALID_HOURS" \
+        -Dquality.owasp.data.directory="$CI_PROJECT_DIR/.m2/dependency-check-data" \
+        dependency-check:check

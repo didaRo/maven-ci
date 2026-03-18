@@ -1,0 +1,174 @@
+spec:
+  description: End-to-end Maven CI stack that chains build, quality, snapshot, and release components in the expected order.
+  inputs:
+    job_prefix:
+      description: Prefix used for all generated job names.
+      regex: ^[a-z0-9][a-z0-9_]{0,62}$
+      default: maven
+    image:
+      description: Container image used by all component jobs.
+      regex: ^[^\r\n]+$
+      default: maven:3.9.6-eclipse-temurin-21
+    runner_tags:
+      description: Optional GitLab runner tags applied to every generated job.
+      type: array
+      default: []
+    verify_stage:
+      description: Stage used for mvn clean verify.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: verify
+    quality_stage:
+      description: Stage used for the Sonar job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: quality
+    security_stage:
+      description: Stage used for the OWASP job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: quality
+    snapshot_stage:
+      description: Stage used for snapshot publication.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: snapshot
+    release_stage:
+      description: Stage used for the release job.
+      regex: ^[A-Za-z0-9_.:-]+$
+      default: release
+    project_dir:
+      description: Directory containing the consumer pom.xml.
+      regex: ^[^\r\n]+$
+      default: .
+    maven_opts:
+      description: Maven JVM options, including the local repository path.
+      regex: ^[^\r\n]*$
+      default: -Dmaven.repo.local=.m2/repository
+    maven_cli_opts:
+      description: Additional Maven CLI options.
+      regex: ^[^\r\n]*$
+      default: -B -ntp
+    enable_sonar:
+      description: Enable the Sonar job when Sonar variables are configured.
+      type: boolean
+      default: false
+    sonar_allow_failure:
+      description: Mark the Sonar job as optional.
+      type: boolean
+      default: true
+    enable_owasp:
+      description: Enable OWASP dependency-check.
+      type: boolean
+      default: true
+    owasp_allow_failure:
+      description: Mark the OWASP job as optional.
+      type: boolean
+      default: false
+    owasp_allow_without_nvd_api_key:
+      description: Force OWASP even when NVD_API_KEY is not configured.
+      type: boolean
+      default: false
+    owasp_fail_cvss:
+      description: CVSS threshold used by OWASP dependency-check.
+      regex: ^[0-9]+(\.[0-9]+)?$
+      default: '9.0'
+    owasp_nvd_valid_hours:
+      description: Cache validity in hours for OWASP NVD data.
+      regex: ^[0-9]+$
+      default: '24'
+    enable_auto_snapshot:
+      description: Enable automatic snapshot publication on push pipelines.
+      type: boolean
+      default: true
+    enable_manual_snapshot:
+      description: Expose the manual snapshot job in the pipeline UI.
+      type: boolean
+      default: true
+    snapshot_branch_regex:
+      description: Regex used to detect user story branches for automatic snapshot publication.
+      regex: ^[^\r\n]+$
+      default: ^US[0-9][A-Za-z0-9._/-]*$
+    manual_any_branch:
+      description: Allow manual snapshot publication on any branch.
+      type: boolean
+      default: false
+    snapshot_args:
+      description: Extra Maven arguments appended to the snapshot deploy command.
+      regex: ^[^\r\n]*$
+      default: -DskipTests
+    git_depth:
+      description: Git depth used by the release job. Keep 0 when you need full history and tags.
+      type: number
+      default: 0
+    release_profile:
+      description: Maven profile activated during release:perform.
+      regex: ^[A-Za-z0-9_.-]+$
+      default: release
+    release_args:
+      description: Arguments passed to maven-release-plugin perform goals.
+      regex: ^[^\r\n]*$
+      default: -DskipTests -Dquality.owasp.skip=true -Dsonar.skip=true
+    next_snapshot_strategy:
+      description: Strategy used when NEXT_SNAPSHOT_VERSION is not provided.
+      options:
+        - patch
+        - minor
+      default: patch
+---
+include:
+  - local: '/templates/maven-build-test-quality/template.yml'
+    inputs:
+      job_prefix: $[[ inputs.job_prefix ]]
+      image: $[[ inputs.image ]]
+      runner_tags: $[[ inputs.runner_tags ]]
+      verify_stage: $[[ inputs.verify_stage ]]
+      quality_stage: $[[ inputs.quality_stage ]]
+      security_stage: $[[ inputs.security_stage ]]
+      verify_needs: []
+      quality_needs:
+        - $[[ inputs.job_prefix ]]_build_test
+      project_dir: $[[ inputs.project_dir ]]
+      maven_opts: $[[ inputs.maven_opts ]]
+      maven_cli_opts: $[[ inputs.maven_cli_opts ]]
+      enable_sonar: $[[ inputs.enable_sonar ]]
+      sonar_allow_failure: $[[ inputs.sonar_allow_failure ]]
+      enable_owasp: $[[ inputs.enable_owasp ]]
+      owasp_allow_failure: $[[ inputs.owasp_allow_failure ]]
+      owasp_allow_without_nvd_api_key: $[[ inputs.owasp_allow_without_nvd_api_key ]]
+      owasp_fail_cvss: $[[ inputs.owasp_fail_cvss ]]
+      owasp_nvd_valid_hours: $[[ inputs.owasp_nvd_valid_hours ]]
+
+  - local: '/templates/maven-snapshot/template.yml'
+    inputs:
+      job_prefix: $[[ inputs.job_prefix ]]
+      image: $[[ inputs.image ]]
+      runner_tags: $[[ inputs.runner_tags ]]
+      snapshot_stage: $[[ inputs.snapshot_stage ]]
+      snapshot_needs:
+        - $[[ inputs.job_prefix ]]_build_test
+        - $[[ inputs.job_prefix ]]_sonar_quality
+        - $[[ inputs.job_prefix ]]_owasp_security
+      project_dir: $[[ inputs.project_dir ]]
+      maven_opts: $[[ inputs.maven_opts ]]
+      maven_cli_opts: $[[ inputs.maven_cli_opts ]]
+      enable_auto_snapshot: $[[ inputs.enable_auto_snapshot ]]
+      enable_manual_snapshot: $[[ inputs.enable_manual_snapshot ]]
+      snapshot_branch_regex: $[[ inputs.snapshot_branch_regex ]]
+      manual_any_branch: $[[ inputs.manual_any_branch ]]
+      snapshot_args: $[[ inputs.snapshot_args ]]
+
+  - local: '/templates/maven-release/template.yml'
+    inputs:
+      job_prefix: $[[ inputs.job_prefix ]]
+      image: $[[ inputs.image ]]
+      runner_tags: $[[ inputs.runner_tags ]]
+      release_stage: $[[ inputs.release_stage ]]
+      release_needs:
+        - $[[ inputs.job_prefix ]]_build_test
+        - $[[ inputs.job_prefix ]]_sonar_quality
+        - $[[ inputs.job_prefix ]]_owasp_security
+      project_dir: $[[ inputs.project_dir ]]
+      maven_opts: $[[ inputs.maven_opts ]]
+      maven_cli_opts: $[[ inputs.maven_cli_opts ]]
+      git_depth: $[[ inputs.git_depth ]]
+      release_profile: $[[ inputs.release_profile ]]
+      release_args: $[[ inputs.release_args ]]
+      next_snapshot_strategy: $[[ inputs.next_snapshot_strategy ]]
+

@@ -1,0 +1,624 @@
+name: Reusable Maven Build, Test, Quality and Security
+
+on:
+  workflow_call:
+    inputs:
+      project_dir:
+        description: Directory containing the consumer pom.xml.
+        required: true
+        type: string
+      maven_repository_owner:
+        description: Owner used by settings.xml when it references MAVEN_REPOSITORY_OWNER.
+        required: false
+        default: ''
+        type: string
+      build_java_version:
+        description: Java version used by quality and security jobs.
+        required: false
+        default: '25'
+        type: string
+      java_matrix:
+        description: JSON array of Java versions used by verify.
+        required: false
+        default: '["25"]'
+        type: string
+      coverage_minimum:
+        description: Minimum JaCoCo line coverage percentage.
+        required: false
+        default: '85'
+        type: string
+      coverage_max_drop_percent:
+        description: Maximum allowed line coverage drop percentage.
+        required: false
+        default: '5'
+        type: string
+      coverage_allow_failure:
+        description: Allow the coverage gate to fail without blocking the workflow.
+        required: false
+        default: false
+        type: boolean
+      sonar_enabled:
+        description: Enable Sonar analysis when configuration is present.
+        required: false
+        default: true
+        type: boolean
+      sonar_allow_failure:
+        description: Allow the Sonar job to fail without blocking the workflow.
+        required: false
+        default: false
+        type: boolean
+      sonar_organization:
+        description: Sonar organization key.
+        required: false
+        default: ''
+        type: string
+      sonar_project_key:
+        description: Sonar project key.
+        required: false
+        default: ''
+        type: string
+      owasp_enabled:
+        description: Enable OWASP dependency-check.
+        required: false
+        default: true
+        type: boolean
+      owasp_allow_failure:
+        description: Allow the OWASP job to fail without blocking the workflow.
+        required: false
+        default: false
+        type: boolean
+      owasp_mode:
+        description: OWASP execution mode.
+        required: false
+        default: auto
+        type: string
+      owasp_allow_without_nvd_api_key:
+        description: Allow OWASP execution without NVD_API_KEY.
+        required: false
+        default: false
+        type: boolean
+      owasp_fail_cvss:
+        description: CVSS threshold used by OWASP.
+        required: false
+        default: '9.0'
+        type: string
+      owasp_nvd_valid_hours:
+        description: Cache validity in hours for OWASP NVD data.
+        required: false
+        default: '24'
+        type: string
+      owasp_nvd_datafeed_url:
+        description: Internal NVD mirror URL.
+        required: false
+        default: ''
+        type: string
+      owasp_nvd_datafeed_server_id:
+        description: Maven server id for the NVD mirror.
+        required: false
+        default: owasp-nvd
+        type: string
+      owasp_hosted_suppressions_url:
+        description: Internal hosted suppressions URL.
+        required: false
+        default: ''
+        type: string
+      owasp_hosted_suppressions_server_id:
+        description: Maven server id for hosted suppressions.
+        required: false
+        default: owasp-suppressions
+        type: string
+      owasp_retirejs_url:
+        description: Internal RetireJS URL.
+        required: false
+        default: ''
+        type: string
+      owasp_retirejs_server_id:
+        description: Maven server id for RetireJS.
+        required: false
+        default: owasp-retirejs
+        type: string
+      owasp_known_exploited_url:
+        description: Internal CISA known exploited vulnerabilities URL.
+        required: false
+        default: ''
+        type: string
+      owasp_known_exploited_server_id:
+        description: Maven server id for the known exploited feed.
+        required: false
+        default: owasp-known-exploited
+        type: string
+    secrets:
+      maven_settings_xml:
+        required: false
+      sonar_token:
+        required: false
+      nvd_api_key:
+        required: false
+      owasp_nvd_username:
+        required: false
+      owasp_nvd_password:
+        required: false
+      owasp_hosted_suppressions_username:
+        required: false
+      owasp_hosted_suppressions_password:
+        required: false
+      owasp_retirejs_username:
+        required: false
+      owasp_retirejs_password:
+        required: false
+      owasp_known_exploited_username:
+        required: false
+      owasp_known_exploited_password:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  PROJECT_DIR: ${{ inputs.project_dir }}
+  MAVEN_REPOSITORY_OWNER: ${{ inputs.maven_repository_owner || github.actor }}
+  MAVEN_REPOSITORY_TOKEN: ${{ github.token }}
+  GITHUB_TOKEN: ${{ github.token }}
+  BUILD_JAVA_VERSION: ${{ inputs.build_java_version }}
+  COVERAGE_MINIMUM: ${{ inputs.coverage_minimum }}
+  COVERAGE_MAX_DROP_PERCENT: ${{ inputs.coverage_max_drop_percent }}
+  COVERAGE_ALLOW_FAILURE: ${{ inputs.coverage_allow_failure }}
+  SONAR_ENABLED: ${{ inputs.sonar_enabled }}
+  SONAR_ALLOW_FAILURE: ${{ inputs.sonar_allow_failure }}
+  SONAR_ORGANIZATION: ${{ inputs.sonar_organization }}
+  SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+  OWASP_ENABLED: ${{ inputs.owasp_enabled }}
+  OWASP_ALLOW_FAILURE: ${{ inputs.owasp_allow_failure }}
+  OWASP_MODE: ${{ inputs.owasp_mode }}
+  OWASP_ALLOW_WITHOUT_NVD_API_KEY: ${{ inputs.owasp_allow_without_nvd_api_key }}
+  OWASP_FAIL_CVSS: ${{ inputs.owasp_fail_cvss }}
+  OWASP_NVD_VALID_HOURS: ${{ inputs.owasp_nvd_valid_hours }}
+  OWASP_NVD_DATAFEED_URL: ${{ inputs.owasp_nvd_datafeed_url }}
+  OWASP_NVD_DATAFEED_SERVER_ID: ${{ inputs.owasp_nvd_datafeed_server_id }}
+  OWASP_HOSTED_SUPPRESSIONS_URL: ${{ inputs.owasp_hosted_suppressions_url }}
+  OWASP_HOSTED_SUPPRESSIONS_SERVER_ID: ${{ inputs.owasp_hosted_suppressions_server_id }}
+  OWASP_RETIREJS_URL: ${{ inputs.owasp_retirejs_url }}
+  OWASP_RETIREJS_SERVER_ID: ${{ inputs.owasp_retirejs_server_id }}
+  OWASP_KNOWN_EXPLOITED_URL: ${{ inputs.owasp_known_exploited_url }}
+  OWASP_KNOWN_EXPLOITED_SERVER_ID: ${{ inputs.owasp_known_exploited_server_id }}
+
+jobs:
+  verify:
+    name: Build and tests (Java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    env:
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ${{ fromJSON(inputs.java_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Maven clean verify
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          MVN_ARGS=(-B -ntp)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" -Djava.version="${{ matrix.java }}" clean verify
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-reports-java-${{ matrix.java }}
+          path: |
+            ${{ env.PROJECT_DIR }}/target/surefire-reports/*.xml
+            ${{ env.PROJECT_DIR }}/target/failsafe-reports/*.xml
+          if-no-files-found: warn
+
+      - name: Upload verified target for downstream jobs
+        if: ${{ matrix.java == env.BUILD_JAVA_VERSION }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: verify-target-java-${{ matrix.java }}
+          path: ${{ env.PROJECT_DIR }}/target
+          if-no-files-found: error
+
+  coverage_regression:
+    name: Coverage regression
+    runs-on: ubuntu-latest
+    needs: verify
+    env:
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.BUILD_JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Download verified target
+        uses: actions/download-artifact@v4
+        with:
+          name: verify-target-java-${{ env.BUILD_JAVA_VERSION }}
+          path: ${{ env.PROJECT_DIR }}/target
+
+      - name: Build baseline coverage from pull request target branch
+        if: ${{ github.event_name == 'pull_request' }}
+        id: baseline
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            MVN_NAME=./mvnw
+          else
+            MVN_NAME=mvn
+          fi
+
+          BASELINE_DIR="$RUNNER_TEMP/baseline-worktree"
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git worktree add --detach "$BASELINE_DIR" "origin/${{ github.base_ref }}"
+
+          if [ -f "$BASELINE_DIR/mvnw" ]; then
+            chmod +x "$BASELINE_DIR/mvnw"
+            BASELINE_MVN="$BASELINE_DIR/mvnw"
+          else
+            BASELINE_MVN="$MVN_NAME"
+          fi
+
+          BASELINE_ARGS=(-B -ntp)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            BASELINE_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          "$BASELINE_MVN" "${BASELINE_ARGS[@]}" -f "$BASELINE_DIR/$PROJECT_DIR/pom.xml" -Djava.version="$BUILD_JAVA_VERSION" clean verify
+          echo "baseline_report_path=$BASELINE_DIR/$PROJECT_DIR/target/site/jacoco/jacoco.xml" >> "$GITHUB_OUTPUT"
+
+      - name: Check coverage drop
+        shell: pwsh
+        continue-on-error: ${{ env.COVERAGE_ALLOW_FAILURE == 'true' }}
+        env:
+          CURRENT_REPORT_PATH: ${{ github.workspace }}/${{ env.PROJECT_DIR }}/target/site/jacoco/jacoco.xml
+          BASELINE_REPORT_PATH: ${{ steps.baseline.outputs.baseline_report_path }}
+        run: |
+          $allowFailure = $env:COVERAGE_ALLOW_FAILURE -eq "true"
+          $params = @{
+            CurrentReportPath = $env:CURRENT_REPORT_PATH
+            MinimumCoveragePercentage = [double]$env:COVERAGE_MINIMUM
+            MaxDropPercentage = [double]$env:COVERAGE_MAX_DROP_PERCENT
+          }
+
+          if ($env:BASELINE_REPORT_PATH) {
+            $params["BaselineReportPath"] = $env:BASELINE_REPORT_PATH
+          }
+
+          if ($allowFailure) {
+            & ./.github/scripts/compare-jacoco.ps1 @params -AllowFailure
+          } else {
+            & ./.github/scripts/compare-jacoco.ps1 @params
+          }
+
+      - name: Upload JaCoCo report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: jacoco-report
+          path: ${{ env.PROJECT_DIR }}/target/site/jacoco
+          if-no-files-found: warn
+
+  sonar_quality:
+    name: Sonar quality gate
+    runs-on: ubuntu-latest
+    needs: verify
+    env:
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+      SONAR_TOKEN: ${{ secrets.sonar_token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.BUILD_JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Download verified target
+        if: ${{ env.SONAR_ENABLED == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: verify-target-java-${{ env.BUILD_JAVA_VERSION }}
+          path: ${{ env.PROJECT_DIR }}/target
+
+      - name: Cache Sonar
+        if: ${{ env.SONAR_ENABLED == 'true' }}
+        uses: actions/cache@v5
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: SonarCloud analysis
+        if: ${{ env.SONAR_ENABLED == 'true' && env.SONAR_ORGANIZATION != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_TOKEN != '' }}
+        continue-on-error: ${{ env.SONAR_ALLOW_FAILURE == 'true' }}
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          MVN_ARGS=(-B -ntp)
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            MVN_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          "$MVN" "${MVN_ARGS[@]}" -f "$PROJECT_DIR/pom.xml" -Djava.version="$BUILD_JAVA_VERSION" -DskipTests \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.java.test.binaries=target/test-classes \
+            sonar:sonar \
+            -Dsonar.organization="$SONAR_ORGANIZATION" \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY"
+
+      - name: Explain Sonar skip
+        if: ${{ !(env.SONAR_ENABLED == 'true' && env.SONAR_ORGANIZATION != '' && env.SONAR_PROJECT_KEY != '' && env.SONAR_TOKEN != '') }}
+        shell: bash
+        run: |
+          echo "SonarCloud skipped. Configure SONAR_ORGANIZATION, SONAR_PROJECT_KEY and SONAR_TOKEN to enable it." >> "$GITHUB_STEP_SUMMARY"
+
+  security_scan:
+    name: OWASP security scan
+    runs-on: ubuntu-latest
+    needs: verify
+    env:
+      MAVEN_SETTINGS_XML: ${{ secrets.maven_settings_xml }}
+      NVD_API_KEY: ${{ secrets.nvd_api_key }}
+      OWASP_NVD_USERNAME: ${{ secrets.owasp_nvd_username }}
+      OWASP_NVD_PASSWORD: ${{ secrets.owasp_nvd_password }}
+      OWASP_HOSTED_SUPPRESSIONS_USERNAME: ${{ secrets.owasp_hosted_suppressions_username }}
+      OWASP_HOSTED_SUPPRESSIONS_PASSWORD: ${{ secrets.owasp_hosted_suppressions_password }}
+      OWASP_RETIREJS_USERNAME: ${{ secrets.owasp_retirejs_username }}
+      OWASP_RETIREJS_PASSWORD: ${{ secrets.owasp_retirejs_password }}
+      OWASP_KNOWN_EXPLOITED_USERNAME: ${{ secrets.owasp_known_exploited_username }}
+      OWASP_KNOWN_EXPLOITED_PASSWORD: ${{ secrets.owasp_known_exploited_password }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.BUILD_JAVA_VERSION }}
+          cache: maven
+
+      - name: Prepare Maven settings
+        uses: ./.github/actions/prepare-maven-settings
+        with:
+          settings_xml: ${{ env.MAVEN_SETTINGS_XML }}
+
+      - name: Resolve OWASP mode
+        if: ${{ env.OWASP_ENABLED == 'true' }}
+        id: owasp_mode
+        shell: bash
+        run: |
+          requested_mode="$OWASP_MODE"
+
+          if [ "$requested_mode" = "auto" ]; then
+            if [ -n "$OWASP_NVD_DATAFEED_URL" ]; then
+              effective_mode="internal"
+              resolution_reason="CI_OWASP_NVD_DATAFEED_URL is configured"
+            else
+              effective_mode="external"
+              resolution_reason="no internal mirror is configured"
+            fi
+          else
+            effective_mode="$requested_mode"
+            resolution_reason="CI_OWASP_MODE is explicitly set"
+          fi
+
+          case "$effective_mode" in
+            external|internal|disabled)
+              ;;
+            *)
+              echo "::error::Unsupported CI_OWASP_MODE value: $requested_mode. Supported values: auto, external, internal, disabled."
+              exit 1
+              ;;
+          esac
+
+          echo "effective_mode=$effective_mode" >> "$GITHUB_OUTPUT"
+          echo "resolution_reason=$resolution_reason" >> "$GITHUB_OUTPUT"
+          echo "OWASP effective mode: $effective_mode ($resolution_reason)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate OWASP enterprise hardened configuration
+        if: ${{ env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode == 'internal' }}
+        shell: bash
+        run: |
+          if [ -z "$OWASP_NVD_DATAFEED_URL" ]; then
+            echo "::error::CI_OWASP_NVD_DATAFEED_URL is required when CI_OWASP_MODE=internal."
+            exit 1
+          fi
+
+      - name: Build cache key suffix
+        if: ${{ env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        id: owasp_cache_key
+        shell: bash
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore OWASP dependency data
+        if: ${{ env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: owasp-data-${{ runner.os }}-${{ steps.owasp_cache_key.outputs.date }}
+          restore-keys: |
+            owasp-data-${{ runner.os }}-
+
+      - name: Explain OWASP skip in disabled mode
+        if: ${{ env.OWASP_ENABLED != 'true' || steps.owasp_mode.outputs.effective_mode == 'disabled' }}
+        shell: bash
+        run: |
+          echo "OWASP dependency-check skipped because it is disabled. Use CI_ENABLE_OWASP=true and CI_OWASP_MODE=auto, external or internal to enable it." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain OWASP skip without NVD API key
+        if: ${{ env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode == 'external' && env.NVD_API_KEY == '' && env.OWASP_ALLOW_WITHOUT_NVD_API_KEY != 'true' }}
+        shell: bash
+        run: |
+          echo "OWASP dependency-check skipped because NVD_API_KEY is not configured. Without an NVD API key the initial sync can take a very long time. Add the NVD_API_KEY secret or set CI_OWASP_ALLOW_WITHOUT_NVD_API_KEY=true to force the scan anyway." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: OWASP dependency-check
+        if: ${{ env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        continue-on-error: ${{ env.OWASP_ALLOW_FAILURE == 'true' }}
+        shell: bash
+        env:
+          EFFECTIVE_OWASP_MODE: ${{ steps.owasp_mode.outputs.effective_mode }}
+        run: |
+          set -euo pipefail
+
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            MVN=./mvnw
+          else
+            MVN=mvn
+          fi
+
+          ODC_ARGS=(
+            -B
+            -ntp
+            -f "$PROJECT_DIR/pom.xml"
+            -Psecurity
+            -Djava.version="$BUILD_JAVA_VERSION"
+            -DskipTests
+            -Dquality.owasp.fail.cvss="$OWASP_FAIL_CVSS"
+            -Dquality.owasp.nvd.valid.hours="$OWASP_NVD_VALID_HOURS"
+          )
+
+          if [ -n "${MAVEN_SETTINGS_FILE:-}" ]; then
+            ODC_ARGS+=(--settings "$MAVEN_SETTINGS_FILE")
+          fi
+
+          case "$EFFECTIVE_OWASP_MODE" in
+            internal)
+              echo "Running OWASP dependency-check in enterprise hardened mode using internal mirrors."
+              ODC_ARGS+=(
+                "-DnvdDatafeedUrl=$OWASP_NVD_DATAFEED_URL"
+                "-DnvdDatafeedServerId=$OWASP_NVD_DATAFEED_SERVER_ID"
+                "-DossIndexAnalyzerEnabled=false"
+                "-DnodeAuditAnalyzerEnabled=false"
+                "-DyarnAuditAnalyzerEnabled=false"
+                "-DpnpmAuditAnalyzerEnabled=false"
+                "-DretireJsAnalyzerEnabled=false"
+                "-DhostedSuppressionsEnabled=false"
+                "-DknownExploitedEnabled=false"
+              )
+
+              if [ -n "$OWASP_HOSTED_SUPPRESSIONS_URL" ]; then
+                ODC_ARGS+=(
+                  "-DhostedSuppressionsEnabled=true"
+                  "-DhostedSuppressionsUrl=$OWASP_HOSTED_SUPPRESSIONS_URL"
+                  "-DhostedSuppressionsServerId=$OWASP_HOSTED_SUPPRESSIONS_SERVER_ID"
+                )
+              fi
+
+              if [ -n "$OWASP_RETIREJS_URL" ]; then
+                ODC_ARGS+=(
+                  "-DretireJsAnalyzerEnabled=true"
+                  "-DretireJsUrl=$OWASP_RETIREJS_URL"
+                  "-DretireJsUrlServerId=$OWASP_RETIREJS_SERVER_ID"
+                )
+              fi
+
+              if [ -n "$OWASP_KNOWN_EXPLOITED_URL" ]; then
+                ODC_ARGS+=(
+                  "-DknownExploitedEnabled=true"
+                  "-DknownExploitedUrl=$OWASP_KNOWN_EXPLOITED_URL"
+                  "-DknownExploitedServerId=$OWASP_KNOWN_EXPLOITED_SERVER_ID"
+                )
+              fi
+              ;;
+            external)
+              echo "Running OWASP dependency-check in standard external mode."
+              ;;
+            *)
+              echo "::error::Unsupported effective OWASP mode value: $EFFECTIVE_OWASP_MODE"
+              exit 1
+              ;;
+          esac
+
+          "$MVN" "${ODC_ARGS[@]}" dependency-check:check
+
+      - name: Save OWASP dependency data
+        if: ${{ always() && env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: owasp-data-${{ runner.os }}-${{ steps.owasp_cache_key.outputs.date }}
+
+      - name: Upload OWASP reports
+        if: ${{ always() && env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: owasp-report
+          path: |
+            ${{ env.PROJECT_DIR }}/target/dependency-check/dependency-check-report.html
+            ${{ env.PROJECT_DIR }}/target/dependency-check/dependency-check-report.json
+            ${{ env.PROJECT_DIR }}/target/dependency-check/dependency-check-report.sarif
+          if-no-files-found: warn
+
+      - name: Detect SARIF report
+        if: ${{ always() && env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && (steps.owasp_mode.outputs.effective_mode == 'internal' || env.NVD_API_KEY != '' || env.OWASP_ALLOW_WITHOUT_NVD_API_KEY == 'true') }}
+        id: sarif
+        shell: bash
+        run: |
+          if [ -f "$PROJECT_DIR/target/dependency-check/dependency-check-report.sarif" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload SARIF to GitHub Security
+        if: ${{ always() && env.OWASP_ENABLED == 'true' && steps.owasp_mode.outputs.effective_mode != 'disabled' && steps.sarif.outputs.exists == 'true' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.PROJECT_DIR }}/target/dependency-check/dependency-check-report.sarif
+          category: owasp-dependency-check
