@@ -11,7 +11,7 @@
 
 	<groupId>com.example</groupId>
 	<artifactId>spring-boot-actuator-regression</artifactId>
-	<version>1.0.0-SNAPSHOT</version>
+	<version>1.0.1</version>
 	<name>spring-boot-actuator-regression</name>
 	<description>Spring Boot witness sample for Maven CI/CD regression, quality, security and release automation</description>
 
@@ -21,7 +21,7 @@
 		<maven.min.version>3.8.5</maven.min.version>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-		<project.build.outputTimestamp>2026-03-18T06:16:41Z</project.build.outputTimestamp>
+		<project.build.outputTimestamp>2026-03-31T08:28:09Z</project.build.outputTimestamp>
 		<maven.build.timestamp.format>yyyy-MM-dd'T'HH:mm:ss'Z'</maven.build.timestamp.format>
 
 		<maven.compiler.plugin.version>3.14.0</maven.compiler.plugin.version>
@@ -116,7 +116,7 @@
 	<scm>
 		<connection>scm:git:https://github.com/didaRo/maven-ci.git</connection>
 		<developerConnection>scm:git:https://github.com/didaRo/maven-ci.git</developerConnection>
-		<tag>HEAD</tag>
+		<tag>1.0.1</tag>
 		<url>https://github.com/didaRo/maven-ci</url>
 	</scm>
 
